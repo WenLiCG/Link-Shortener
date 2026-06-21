@@ -138,12 +138,34 @@ export interface DomainDetail extends RedirectDomain {
   jobs: DomainJob[];
   sources: Array<{ referer: string; visits: number }>;
   trend: Array<{ day: string; visits: number }>;
+  geography: {
+    countries: Array<{ country: string | null; visits: number }>;
+    regions: Array<{ country: string | null; region: string | null; visits: number }>;
+    cities: Array<{ country: string | null; region: string | null; city: string | null; visits: number }>;
+    locations: Array<{ country: string | null; city: string | null; latitude: number; longitude: number; visits: number }>;
+  };
+  clientStats: {
+    languages: Array<{ language: string | null; visits: number }>;
+    timezones: Array<{ timezone: string | null; visits: number }>;
+    operatingSystems: Array<{ operatingSystem: string | null; visits: number }>;
+    browsers: Array<{ browser: string | null; visits: number }>;
+    deviceTypes: Array<{ deviceType: string | null; visits: number }>;
+  };
   recentVisits: Array<{
     id: string;
     host: string;
     path: string;
     referer: string | null;
     country: string | null;
+    region: string | null;
+    city: string | null;
+    timezone: string | null;
+    latitude: number | null;
+    longitude: number | null;
+    language: string | null;
+    operatingSystem: string | null;
+    browser: string | null;
+    deviceType: string | null;
     userAgent: string | null;
     targetHost: string;
     hideReferer: boolean;

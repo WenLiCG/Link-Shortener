@@ -36,6 +36,14 @@ function numberValue(value: RowValue): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function optionalNumber(value: RowValue): number | null {
+  if (value === null) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -635,6 +643,131 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       daysAgo(30),
     )
   ).map((row) => ({ day: text(row.day), visits: numberValue(row.visits) }));
+  const countries = (
+    await all(
+      db,
+      `SELECT country, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY country
+       ORDER BY visits DESC
+       LIMIT 50`,
+      id,
+    )
+  ).map((row) => ({ country: optionalText(row.country), visits: numberValue(row.visits) }));
+  const regions = (
+    await all(
+      db,
+      `SELECT country, region, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY country, region
+       ORDER BY visits DESC
+       LIMIT 50`,
+      id,
+    )
+  ).map((row) => ({ country: optionalText(row.country), region: optionalText(row.region), visits: numberValue(row.visits) }));
+  const cities = (
+    await all(
+      db,
+      `SELECT country, region, city, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY country, region, city
+       ORDER BY visits DESC
+       LIMIT 50`,
+      id,
+    )
+  ).map((row) => ({
+    country: optionalText(row.country),
+    region: optionalText(row.region),
+    city: optionalText(row.city),
+    visits: numberValue(row.visits),
+  }));
+  const locations = (
+    await all(
+      db,
+      `SELECT country, city, latitude, longitude, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+         AND latitude IS NOT NULL
+         AND longitude IS NOT NULL
+       GROUP BY country, city, latitude, longitude
+       ORDER BY visits DESC
+       LIMIT 80`,
+      id,
+    )
+  )
+    .map((row) => ({
+      country: optionalText(row.country),
+      city: optionalText(row.city),
+      latitude: optionalNumber(row.latitude),
+      longitude: optionalNumber(row.longitude),
+      visits: numberValue(row.visits),
+    }))
+    .filter((row): row is { country: string | null; city: string | null; latitude: number; longitude: number; visits: number } => (
+      row.latitude !== null && row.longitude !== null
+    ));
+  const languages = (
+    await all(
+      db,
+      `SELECT language, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY language
+       ORDER BY visits DESC
+       LIMIT 20`,
+      id,
+    )
+  ).map((row) => ({ language: optionalText(row.language), visits: numberValue(row.visits) }));
+  const timezones = (
+    await all(
+      db,
+      `SELECT timezone, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY timezone
+       ORDER BY visits DESC
+       LIMIT 20`,
+      id,
+    )
+  ).map((row) => ({ timezone: optionalText(row.timezone), visits: numberValue(row.visits) }));
+  const operatingSystems = (
+    await all(
+      db,
+      `SELECT operating_system, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY operating_system
+       ORDER BY visits DESC
+       LIMIT 20`,
+      id,
+    )
+  ).map((row) => ({ operatingSystem: optionalText(row.operating_system), visits: numberValue(row.visits) }));
+  const browsers = (
+    await all(
+      db,
+      `SELECT browser, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY browser
+       ORDER BY visits DESC
+       LIMIT 20`,
+      id,
+    )
+  ).map((row) => ({ browser: optionalText(row.browser), visits: numberValue(row.visits) }));
+  const deviceTypes = (
+    await all(
+      db,
+      `SELECT device_type, COUNT(*) AS visits
+       FROM visit_events
+       WHERE redirect_domain_id = ?
+       GROUP BY device_type
+       ORDER BY visits DESC
+       LIMIT 20`,
+      id,
+    )
+  ).map((row) => ({ deviceType: optionalText(row.device_type), visits: numberValue(row.visits) }));
   const recentVisits = (
     await all(
       db,
@@ -650,12 +783,29 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
     path: text(row.path),
     referer: optionalText(row.referer),
     country: optionalText(row.country),
+    region: optionalText(row.region),
+    city: optionalText(row.city),
+    timezone: optionalText(row.timezone),
+    latitude: optionalNumber(row.latitude),
+    longitude: optionalNumber(row.longitude),
+    language: optionalText(row.language),
+    operatingSystem: optionalText(row.operating_system),
+    browser: optionalText(row.browser),
+    deviceType: optionalText(row.device_type),
     userAgent: optionalText(row.user_agent),
     targetHost: text(row.target_host),
     hideReferer: bool(row.hide_referer),
     visitedAt: text(row.visited_at),
   }));
-  return { ...domain, jobs, sources, trend, recentVisits };
+  return {
+    ...domain,
+    jobs,
+    sources,
+    trend,
+    geography: { countries, regions, cities, locations },
+    clientStats: { languages, timezones, operatingSystems, browsers, deviceTypes },
+    recentVisits,
+  };
 }
 
 export async function createRedirectDomain(
@@ -868,6 +1018,15 @@ export async function recordVisit(
     path: string;
     referer: string | null;
     country: string | null;
+    region: string | null;
+    city: string | null;
+    timezone: string | null;
+    latitude: number | null;
+    longitude: number | null;
+    language: string | null;
+    operatingSystem: string | null;
+    browser: string | null;
+    deviceType: string | null;
     userAgent: string | null;
     targetHost: string;
     hideReferer: boolean;
@@ -879,8 +1038,8 @@ export async function recordVisit(
     db
       .prepare(
         `INSERT INTO visit_events
-         (id, redirect_domain_id, host, path, referer, country, user_agent, target_host, hide_referer, visited_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, redirect_domain_id, host, path, referer, country, region, city, timezone, latitude, longitude, language, operating_system, browser, device_type, user_agent, target_host, hide_referer, visited_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         crypto.randomUUID(),
@@ -889,6 +1048,15 @@ export async function recordVisit(
         input.path,
         input.referer,
         input.country,
+        input.region,
+        input.city,
+        input.timezone,
+        input.latitude,
+        input.longitude,
+        input.language,
+        input.operatingSystem,
+        input.browser,
+        input.deviceType,
         input.userAgent,
         input.targetHost,
         input.hideReferer ? 1 : 0,

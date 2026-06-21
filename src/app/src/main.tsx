@@ -108,12 +108,34 @@ interface DomainDetail extends RedirectDomain {
   }>;
   sources: Array<{ referer: string; visits: number }>;
   trend: Array<{ day: string; visits: number }>;
+  geography: {
+    countries: Array<{ country: string | null; visits: number }>;
+    regions: Array<{ country: string | null; region: string | null; visits: number }>;
+    cities: Array<{ country: string | null; region: string | null; city: string | null; visits: number }>;
+    locations: Array<{ country: string | null; city: string | null; latitude: number; longitude: number; visits: number }>;
+  };
+  clientStats: {
+    languages: Array<{ language: string | null; visits: number }>;
+    timezones: Array<{ timezone: string | null; visits: number }>;
+    operatingSystems: Array<{ operatingSystem: string | null; visits: number }>;
+    browsers: Array<{ browser: string | null; visits: number }>;
+    deviceTypes: Array<{ deviceType: string | null; visits: number }>;
+  };
   recentVisits: Array<{
     id: string;
     host: string;
     path: string;
     referer: string | null;
     country: string | null;
+    region: string | null;
+    city: string | null;
+    timezone: string | null;
+    latitude: number | null;
+    longitude: number | null;
+    language: string | null;
+    operatingSystem: string | null;
+    browser: string | null;
+    deviceType: string | null;
     userAgent: string | null;
     visitedAt: string;
   }>;
@@ -353,6 +375,313 @@ function EmptyState({ title, text }: { title: string; text: string }) {
       <CircleDot size={28} />
       <strong>{title}</strong>
       <span>{text}</span>
+    </div>
+  );
+}
+
+type GeoTab = "countries" | "regions" | "cities";
+type CountryMeta = { name: string; lat: number; lon: number };
+
+const COUNTRY_META: Record<string, CountryMeta> = {
+  AE: { name: "阿联酋", lat: 24.4, lon: 54.4 },
+  AR: { name: "阿根廷", lat: -34.6, lon: -58.4 },
+  AT: { name: "奥地利", lat: 48.2, lon: 16.4 },
+  AU: { name: "澳大利亚", lat: -33.9, lon: 151.2 },
+  BE: { name: "比利时", lat: 50.9, lon: 4.4 },
+  BR: { name: "巴西", lat: -15.8, lon: -47.9 },
+  CA: { name: "加拿大", lat: 45.4, lon: -75.7 },
+  CH: { name: "瑞士", lat: 46.9, lon: 7.4 },
+  CL: { name: "智利", lat: -33.4, lon: -70.7 },
+  CN: { name: "中国", lat: 35.9, lon: 104.2 },
+  CO: { name: "哥伦比亚", lat: 4.7, lon: -74.1 },
+  CZ: { name: "捷克", lat: 50.1, lon: 14.4 },
+  DE: { name: "德国", lat: 52.5, lon: 13.4 },
+  DK: { name: "丹麦", lat: 55.7, lon: 12.6 },
+  EG: { name: "埃及", lat: 30, lon: 31.2 },
+  ES: { name: "西班牙", lat: 40.4, lon: -3.7 },
+  FI: { name: "芬兰", lat: 60.2, lon: 24.9 },
+  FR: { name: "法国", lat: 48.9, lon: 2.4 },
+  GB: { name: "英国", lat: 51.5, lon: -0.1 },
+  HK: { name: "中国香港", lat: 22.3, lon: 114.2 },
+  ID: { name: "印度尼西亚", lat: -6.2, lon: 106.8 },
+  IE: { name: "爱尔兰", lat: 53.3, lon: -6.3 },
+  IL: { name: "以色列", lat: 32.1, lon: 34.8 },
+  IN: { name: "印度", lat: 28.6, lon: 77.2 },
+  IT: { name: "意大利", lat: 41.9, lon: 12.5 },
+  JP: { name: "日本", lat: 35.7, lon: 139.7 },
+  KR: { name: "韩国", lat: 37.6, lon: 127 },
+  MX: { name: "墨西哥", lat: 19.4, lon: -99.1 },
+  MY: { name: "马来西亚", lat: 3.1, lon: 101.7 },
+  NL: { name: "荷兰", lat: 52.4, lon: 4.9 },
+  NO: { name: "挪威", lat: 59.9, lon: 10.8 },
+  NZ: { name: "新西兰", lat: -41.3, lon: 174.8 },
+  PH: { name: "菲律宾", lat: 14.6, lon: 121 },
+  PL: { name: "波兰", lat: 52.2, lon: 21 },
+  PT: { name: "葡萄牙", lat: 38.7, lon: -9.1 },
+  RO: { name: "罗马尼亚", lat: 44.4, lon: 26.1 },
+  RU: { name: "俄罗斯", lat: 55.8, lon: 37.6 },
+  SA: { name: "沙特", lat: 24.7, lon: 46.7 },
+  SE: { name: "瑞典", lat: 59.3, lon: 18.1 },
+  SG: { name: "新加坡", lat: 1.3, lon: 103.8 },
+  TH: { name: "泰国", lat: 13.8, lon: 100.5 },
+  TR: { name: "土耳其", lat: 39.9, lon: 32.9 },
+  TW: { name: "中国台湾", lat: 25, lon: 121.5 },
+  UA: { name: "乌克兰", lat: 50.5, lon: 30.5 },
+  US: { name: "美国", lat: 39.8, lon: -98.6 },
+  VN: { name: "越南", lat: 21, lon: 105.8 },
+  ZA: { name: "南非", lat: -26.2, lon: 28 },
+};
+
+function countryCode(value: string | null): string {
+  return value?.trim().toUpperCase() || "UN";
+}
+
+function countryName(value: string | null): string {
+  const code = countryCode(value);
+  if (code === "T1") return "Tor";
+  if (code === "UN") return "未知国家";
+  try {
+    return new Intl.DisplayNames(["zh-CN"], { type: "region" }).of(code) ?? COUNTRY_META[code]?.name ?? code;
+  } catch {
+    return COUNTRY_META[code]?.name ?? code;
+  }
+}
+
+function geoPoint(meta: CountryMeta): { x: number; y: number } {
+  return {
+    x: ((meta.lon + 180) / 360) * 100,
+    y: ((90 - meta.lat) / 180) * 100,
+  };
+}
+
+function geoPointFromLatLon(latitude: number, longitude: number): { x: number; y: number } {
+  return {
+    x: ((longitude + 180) / 360) * 100,
+    y: ((90 - latitude) / 180) * 100,
+  };
+}
+
+function GeoPanel({ geography }: { geography: DomainDetail["geography"] }) {
+  const [tab, setTab] = useState<GeoTab>("countries");
+  const countries = geography.countries;
+  const total = countries.reduce((sum, row) => sum + row.visits, 0);
+  const maxCountry = Math.max(1, ...countries.map((row) => row.visits));
+  const visibleCountries = countries
+    .map((row) => ({ ...row, code: countryCode(row.country), meta: COUNTRY_META[countryCode(row.country)] }))
+    .filter((row) => row.meta)
+    .slice(0, 24);
+  const mapPoints = geography.locations.length > 0
+    ? geography.locations.slice(0, 80).map((row, index) => ({
+        key: `${row.latitude}-${row.longitude}-${index}`,
+        label: `${row.city || countryName(row.country)} ${row.visits}`,
+        visits: row.visits,
+        point: geoPointFromLatLon(row.latitude, row.longitude),
+      }))
+    : visibleCountries.map((row) => ({
+        key: row.code,
+        label: `${countryName(row.country)} ${row.visits}`,
+        visits: row.visits,
+        point: geoPoint(row.meta),
+      }));
+  const rows =
+    tab === "countries"
+      ? countries.map((row) => ({
+          key: countryCode(row.country),
+          label: `${countryCode(row.country)} ${countryName(row.country)}`,
+          visits: row.visits,
+        }))
+      : tab === "regions"
+        ? geography.regions.map((row, index) => ({
+            key: `${row.country ?? "UN"}-${row.region ?? "unknown"}-${index}`,
+            label: `${countryName(row.country)} / ${row.region || "未知地区"}`,
+            visits: row.visits,
+          }))
+        : geography.cities.map((row, index) => ({
+            key: `${row.country ?? "UN"}-${row.region ?? "unknown"}-${row.city ?? "unknown"}-${index}`,
+            label: `${countryName(row.country)} / ${row.city || "未知城市"}`,
+            visits: row.visits,
+          }));
+  const maxRow = Math.max(1, ...rows.map((row) => row.visits));
+
+  return (
+    <section className="panel geo-panel">
+      <div className="panel-title">
+        <h3>地理位置</h3>
+        <span>基于 Cloudflare 请求地理信息</span>
+      </div>
+      {total === 0 ? (
+        <EmptyState title="暂无地理数据" text="入口域名产生访问后，这里会展示国家、地区和城市分布。" />
+      ) : (
+        <div className="geo-layout">
+          <div className="geo-map">
+            <svg viewBox="0 0 100 52" role="img" aria-label="访问来源地图">
+              <path className="geo-land" d="M8 17c7-5 15-5 22-2 5 3 8 7 13 7 5 1 9-4 15-4 7 0 10 5 17 4 8-1 12-7 18-4 4 2 4 8-1 10-7 4-15 2-21 5-8 4-13 12-24 8-7-2-10-8-18-8-6 0-13 3-18 0-6-4-8-11-3-16Z" />
+              <path className="geo-land" d="M15 35c9 0 11 6 18 6 8 1 12-5 18-3 5 2 3 8-4 9-10 2-21 3-31-1-7-3-8-10-1-11Z" />
+              <path className="geo-land" d="M63 34c7-3 17-2 24 0 5 2 5 7 0 9-10 4-24 3-30-2-3-3 0-6 6-7Z" />
+              <path className="geo-line" d="M0 26h100M50 0v52M25 0v52M75 0v52" />
+              {mapPoints.map((row, index) => {
+                const radius = 1.9 + (row.visits / maxCountry) * 4.8;
+                return (
+                  <g key={row.key}>
+                    <circle className={`geo-bubble geo-bubble-${index % 6}`} cx={row.point.x} cy={row.point.y} r={radius} />
+                    <title>{row.label}</title>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+          <div className="geo-side">
+            <div className="segmented">
+              <button className={tab === "countries" ? "active" : ""} onClick={() => setTab("countries")}>国家</button>
+              <button className={tab === "regions" ? "active" : ""} onClick={() => setTab("regions")}>地区</button>
+              <button className={tab === "cities" ? "active" : ""} onClick={() => setTab("cities")}>城市</button>
+            </div>
+            <div className="geo-list">
+              {rows.length === 0 ? (
+                <EmptyState title="暂无数据" text="该维度还没有可展示的访问记录。" />
+              ) : (
+                rows.slice(0, 12).map((row) => {
+                  const percent = total > 0 ? Math.round((row.visits / total) * 100) : 0;
+                  return (
+                    <div key={row.key} className="geo-row">
+                      <div><span>{row.label}</span><strong>{row.visits} ({percent}%)</strong></div>
+                      <i style={{ width: `${Math.max(4, (row.visits / maxRow) * 100)}%` }} />
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+type BreakdownTab = { key: string; label: string; rows: Array<{ key: string; label: string; visits: number }> };
+
+function formatLanguage(value: string | null): string {
+  if (!value) return "未知";
+  try {
+    const language = value.split("-")[0] ?? value;
+    const name = new Intl.DisplayNames(["zh-CN"], { type: "language" }).of(language);
+    return name ? `${name} (${value})` : value;
+  } catch {
+    return value;
+  }
+}
+
+function BreakdownPanel({ title, tabs }: { title: string; tabs: BreakdownTab[] }) {
+  const [activeKey, setActiveKey] = useState(tabs[0]?.key ?? "");
+  const active = tabs.find((tab) => tab.key === activeKey) ?? tabs[0];
+  const rows = active?.rows ?? [];
+  const total = rows.reduce((sum, row) => sum + row.visits, 0);
+  const maxRow = Math.max(1, ...rows.map((row) => row.visits));
+
+  return (
+    <section className="panel breakdown-panel">
+      <div className="panel-title">
+        <h3>{title}</h3>
+        {tabs.length > 1 && (
+          <div className="segmented">
+            {tabs.map((tab) => (
+              <button key={tab.key} className={active?.key === tab.key ? "active" : ""} onClick={() => setActiveKey(tab.key)}>{tab.label}</button>
+            ))}
+          </div>
+        )}
+      </div>
+      {rows.length === 0 || total === 0 ? (
+        <EmptyState title="暂无数据" text="产生访问后会展示该维度的分布。" />
+      ) : (
+        <div className="breakdown-list">
+          {rows.slice(0, 8).map((row) => {
+            const percent = total > 0 ? Math.round((row.visits / total) * 100) : 0;
+            return (
+              <div key={row.key} className="breakdown-row">
+                <div><span>{row.label || "未知"}</span><strong>{row.visits} ({percent}%)</strong></div>
+                <i style={{ width: `${Math.max(4, (row.visits / maxRow) * 100)}%` }} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AnalyticsPanels({ detail }: { detail: DomainDetail }) {
+  return (
+    <div className="analytics-grid">
+      <BreakdownPanel
+        title="来源"
+        tabs={[{
+          key: "referer",
+          label: "来源",
+          rows: detail.sources.map((source) => ({
+            key: source.referer,
+            label: source.referer,
+            visits: source.visits,
+          })),
+        }]}
+      />
+      <BreakdownPanel
+        title="语言 / 时区"
+        tabs={[
+          {
+            key: "language",
+            label: "语言",
+            rows: detail.clientStats.languages.map((row, index) => ({
+              key: `${row.language ?? "unknown"}-${index}`,
+              label: formatLanguage(row.language),
+              visits: row.visits,
+            })),
+          },
+          {
+            key: "timezone",
+            label: "时区",
+            rows: detail.clientStats.timezones.map((row, index) => ({
+              key: `${row.timezone ?? "unknown"}-${index}`,
+              label: row.timezone || "未知",
+              visits: row.visits,
+            })),
+          },
+        ]}
+      />
+      <BreakdownPanel
+        title="设备"
+        tabs={[{
+          key: "deviceType",
+          label: "设备类型",
+          rows: detail.clientStats.deviceTypes.map((row, index) => ({
+            key: `${row.deviceType ?? "unknown"}-${index}`,
+            label: row.deviceType || "未知",
+            visits: row.visits,
+          })),
+        }]}
+      />
+      <BreakdownPanel
+        title="系统 / 浏览器"
+        tabs={[
+          {
+            key: "os",
+            label: "操作系统",
+            rows: detail.clientStats.operatingSystems.map((row, index) => ({
+              key: `${row.operatingSystem ?? "unknown"}-${index}`,
+              label: row.operatingSystem || "未知",
+              visits: row.visits,
+            })),
+          },
+          {
+            key: "browser",
+            label: "浏览器",
+            rows: detail.clientStats.browsers.map((row, index) => ({
+              key: `${row.browser ?? "unknown"}-${index}`,
+              label: row.browser || "未知",
+              visits: row.visits,
+            })),
+          },
+        ]}
+      />
     </div>
   );
 }
@@ -2318,13 +2647,9 @@ function DetailView({ id, onBack, onUpdated }: { id: string; onBack: () => void;
         <Metric icon={<Cloud />} label="Cloudflare" value={detail.cloudflareZoneStatus ?? "-"} />
         <Metric icon={<Globe2 />} label="Dynadot" value={statusText(detail.dynadotStatus)} />
       </section>
+      <GeoPanel geography={detail.geography} />
+      <AnalyticsPanels detail={detail} />
       <div className="split">
-        <div className="panel">
-          <h3>来源分析</h3>
-          {detail.sources.length === 0 ? <EmptyState title="暂无来源" text="有访问后会显示 Referer 分布。" /> : detail.sources.map((source) => (
-            <div key={source.referer} className="source-row"><span>{source.referer}</span><strong>{source.visits}</strong></div>
-          ))}
-        </div>
         <div className="panel">
           <h3>自动化任务</h3>
           {detail.jobs.length === 0 ? <EmptyState title="暂无任务" text="新增或重试后会生成任务记录。" /> : detail.jobs.map((job) => (

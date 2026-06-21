@@ -220,6 +220,17 @@ export function noRefererHtml(targetUrl: string): Response {
   );
 }
 
+export function noRefererRedirect(targetUrl: string, status = 302): Response {
+  return new Response(null, {
+    status,
+    headers: {
+      location: targetUrl,
+      "referrer-policy": "no-referrer",
+      "cache-control": "no-store",
+    },
+  });
+}
+
 export function daysAgo(days: number): string {
   const date = new Date();
   date.setUTCDate(date.getUTCDate() - days);

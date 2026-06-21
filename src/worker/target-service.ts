@@ -1,5 +1,5 @@
 import { findDomainForwardTarget, findShortLinkByCode, findTargetByHost, recordShortLinkVisit } from "./db";
-import { buildTargetUrl, noRefererHtml } from "./shared";
+import { buildTargetUrl, noRefererHtml, noRefererRedirect } from "./shared";
 
 function html(targetHost: string): string {
   const escaped = targetHost.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
@@ -46,7 +46,7 @@ export async function handleTargetService(request: Request, env: Env): Promise<R
     if (!forwardHost) {
       return new Response("Forward target is not configured.", { status: 404 });
     }
-    return Response.redirect(buildTargetUrl(forwardHost), 302);
+    return noRefererRedirect(buildTargetUrl(forwardHost));
   }
   const shortCodeMatch = url.pathname.match(/^\/([A-Za-z0-9_-]{3,32})\/?$/);
   if (shortCodeMatch) {

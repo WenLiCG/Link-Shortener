@@ -1,0 +1,42 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "multi-domain-redirect-manager",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-06-14",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "workers_dev": true,
+  // For production on a custom admin domain, uncomment and replace this route.
+  // "routes": [
+  //   {
+  //     "pattern": "admin.example.com",
+  //     "custom_domain": true
+  //   }
+  // ],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "multi-domain-redirect-manager",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "vars": {
+    "ADMIN_HOST": "admin.example.com",
+    "WORKER_SCRIPT_NAME": "multi-domain-redirect-manager",
+    "DYNADOT_SANDBOX": "false",
+    "VISIT_EVENT_RETENTION_DAYS": "30"
+  }
+}

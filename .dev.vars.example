@@ -1,0 +1,11 @@
+ADMIN_HOST=localhost
+WORKER_SCRIPT_NAME=multi-domain-redirect-manager
+DYNADOT_SANDBOX=false
+VISIT_EVENT_RETENTION_DAYS=30
+
+# Local-only examples. Replace with your own values.
+ADMIN_PASSWORD_HASH=
+SESSION_SECRET=
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_API_TOKEN=
+DYNADOT_API_KEY=

@@ -1,0 +1,34 @@
+{
+  "name": "link-shortener-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "worker:dev": "wrangler dev --local --port 8787",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run",
+    "typecheck": "tsc -b --pretty false",
+    "wrangler:check": "wrangler deploy --dry-run",
+    "wrangler:types": "wrangler types src/worker/worker-configuration.d.ts",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260613.1",
+    "@types/node": "^24.10.2",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7",
+    "vitest": "^4.0.15",
+    "wrangler": "^4.54.0"
+  }
+}

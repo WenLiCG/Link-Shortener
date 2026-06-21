@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+*.local
+*.log
+*.tsbuildinfo
+coverage/
+scripts/build-direct-worker.mjs
+scripts/build-direct-worker-vite.mjs
+scripts/oauth-proxy.cjs

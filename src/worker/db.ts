@@ -44,6 +44,33 @@ function optionalNumber(value: RowValue): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const PAGE_VIEW_EVENT_FILTER = `lower(path) NOT IN (
+  '/favicon.ico',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/apple-touch-icon.png',
+  '/apple-touch-icon-precomposed.png',
+  '/browserconfig.xml',
+  '/manifest.json',
+  '/site.webmanifest'
+)
+AND lower(path) NOT GLOB '*.avif'
+AND lower(path) NOT GLOB '*.css'
+AND lower(path) NOT GLOB '*.gif'
+AND lower(path) NOT GLOB '*.ico'
+AND lower(path) NOT GLOB '*.jpg'
+AND lower(path) NOT GLOB '*.jpeg'
+AND lower(path) NOT GLOB '*.js'
+AND lower(path) NOT GLOB '*.json'
+AND lower(path) NOT GLOB '*.map'
+AND lower(path) NOT GLOB '*.png'
+AND lower(path) NOT GLOB '*.svg'
+AND lower(path) NOT GLOB '*.webp'
+AND lower(path) NOT GLOB '*.woff'
+AND lower(path) NOT GLOB '*.woff2'
+AND lower(path) NOT GLOB '*.xml'
+AND lower(path) NOT GLOB '*.txt'`;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -626,7 +653,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT COALESCE(NULLIF(referer, ''), '直接访问') AS referer, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY COALESCE(NULLIF(referer, ''), '直接访问')
        ORDER BY visits DESC
        LIMIT 20`,
@@ -648,7 +675,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT country, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY country
        ORDER BY visits DESC
        LIMIT 50`,
@@ -660,7 +687,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT country, region, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY country, region
        ORDER BY visits DESC
        LIMIT 50`,
@@ -672,7 +699,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT country, region, city, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY country, region, city
        ORDER BY visits DESC
        LIMIT 50`,
@@ -689,7 +716,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT country, city, latitude, longitude, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
          AND latitude IS NOT NULL
          AND longitude IS NOT NULL
        GROUP BY country, city, latitude, longitude
@@ -713,7 +740,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT language, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY language
        ORDER BY visits DESC
        LIMIT 20`,
@@ -725,7 +752,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT timezone, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY timezone
        ORDER BY visits DESC
        LIMIT 20`,
@@ -737,7 +764,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT operating_system, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY operating_system
        ORDER BY visits DESC
        LIMIT 20`,
@@ -749,7 +776,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT browser, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY browser
        ORDER BY visits DESC
        LIMIT 20`,
@@ -761,7 +788,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       db,
       `SELECT device_type, COUNT(*) AS visits
        FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        GROUP BY device_type
        ORDER BY visits DESC
        LIMIT 20`,
@@ -772,7 +799,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
     await all(
       db,
       `SELECT * FROM visit_events
-       WHERE redirect_domain_id = ?
+       WHERE redirect_domain_id = ? AND ${PAGE_VIEW_EVENT_FILTER}
        ORDER BY visited_at DESC
        LIMIT 50`,
       id,

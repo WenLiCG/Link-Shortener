@@ -381,6 +381,9 @@ function EmptyState({ title, text }: { title: string; text: string }) {
 
 type GeoTab = "countries" | "regions" | "cities";
 type CountryMeta = { name: string; lat: number; lon: number };
+type GeoJsonGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: number[][][] | number[][][][] };
+type GeoJsonFeature = { type: "Feature"; properties: { ISO_A2?: string; NAME?: string }; geometry: GeoJsonGeometry };
+type CountriesGeoJson = { type: "FeatureCollection"; features: GeoJsonFeature[] };
 
 const COUNTRY_META: Record<string, CountryMeta> = {
   AE: { name: "阿联酋", lat: 24.4, lon: 54.4 },
@@ -461,28 +464,48 @@ function geoPointFromLatLon(latitude: number, longitude: number): { x: number; y
   };
 }
 
+function projectCoordinate(coordinate: number[]): [number, number] {
+  const lon = coordinate[0] ?? 0;
+  const lat = coordinate[1] ?? 0;
+  return [((lon + 180) / 360) * 1000, ((90 - lat) / 180) * 520];
+}
+
+function ringPath(ring: number[][]): string {
+  return ring
+    .map((coordinate, index) => {
+      const [x, y] = projectCoordinate(coordinate);
+      return `${index === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
+function featurePath(feature: GeoJsonFeature): string {
+  if (feature.geometry.type === "Polygon") {
+    return (feature.geometry.coordinates as number[][][]).map((ring) => `${ringPath(ring)} Z`).join(" ");
+  }
+  return (feature.geometry.coordinates as number[][][][])
+    .flatMap((polygon) => polygon.map((ring) => `${ringPath(ring)} Z`))
+    .join(" ");
+}
+
+function countryFill(visits: number, maxVisits: number): string {
+  if (visits <= 0) {
+    return "#dce3ee";
+  }
+  const ratio = Math.max(0.18, Math.min(1, visits / Math.max(1, maxVisits)));
+  if (ratio > 0.75) return "#31b996";
+  if (ratio > 0.5) return "#4c7ff0";
+  if (ratio > 0.3) return "#f4b740";
+  return "#f35f78";
+}
+
 function GeoPanel({ geography }: { geography: DomainDetail["geography"] }) {
   const [tab, setTab] = useState<GeoTab>("countries");
+  const [geoJson, setGeoJson] = useState<CountriesGeoJson | null>(null);
   const countries = geography.countries;
   const total = countries.reduce((sum, row) => sum + row.visits, 0);
   const maxCountry = Math.max(1, ...countries.map((row) => row.visits));
-  const visibleCountries = countries
-    .map((row) => ({ ...row, code: countryCode(row.country), meta: COUNTRY_META[countryCode(row.country)] }))
-    .filter((row) => row.meta)
-    .slice(0, 24);
-  const mapPoints = geography.locations.length > 0
-    ? geography.locations.slice(0, 80).map((row, index) => ({
-        key: `${row.latitude}-${row.longitude}-${index}`,
-        label: `${row.city || countryName(row.country)} ${row.visits}`,
-        visits: row.visits,
-        point: geoPointFromLatLon(row.latitude, row.longitude),
-      }))
-    : visibleCountries.map((row) => ({
-        key: row.code,
-        label: `${countryName(row.country)} ${row.visits}`,
-        visits: row.visits,
-        point: geoPoint(row.meta),
-      }));
+  const countryStats = useMemo(() => new Map(countries.map((row) => [countryCode(row.country), row.visits])), [countries]);
   const rows =
     tab === "countries"
       ? countries.map((row) => ({
@@ -503,6 +526,25 @@ function GeoPanel({ geography }: { geography: DomainDetail["geography"] }) {
           }));
   const maxRow = Math.max(1, ...rows.map((row) => row.visits));
 
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/countries.geojson")
+      .then((response) => response.json() as Promise<CountriesGeoJson>)
+      .then((data) => {
+        if (!cancelled) {
+          setGeoJson(data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGeoJson(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <section className="panel geo-panel">
       <div className="panel-title">
@@ -514,21 +556,27 @@ function GeoPanel({ geography }: { geography: DomainDetail["geography"] }) {
       ) : (
         <div className="geo-layout">
           <div className="geo-map">
-            <svg viewBox="0 0 100 52" role="img" aria-label="访问来源地图">
-              <path className="geo-land" d="M8 17c7-5 15-5 22-2 5 3 8 7 13 7 5 1 9-4 15-4 7 0 10 5 17 4 8-1 12-7 18-4 4 2 4 8-1 10-7 4-15 2-21 5-8 4-13 12-24 8-7-2-10-8-18-8-6 0-13 3-18 0-6-4-8-11-3-16Z" />
-              <path className="geo-land" d="M15 35c9 0 11 6 18 6 8 1 12-5 18-3 5 2 3 8-4 9-10 2-21 3-31-1-7-3-8-10-1-11Z" />
-              <path className="geo-land" d="M63 34c7-3 17-2 24 0 5 2 5 7 0 9-10 4-24 3-30-2-3-3 0-6 6-7Z" />
-              <path className="geo-line" d="M0 26h100M50 0v52M25 0v52M75 0v52" />
-              {mapPoints.map((row, index) => {
-                const radius = 1.9 + (row.visits / maxCountry) * 4.8;
-                return (
-                  <g key={row.key}>
-                    <circle className={`geo-bubble geo-bubble-${index % 6}`} cx={row.point.x} cy={row.point.y} r={radius} />
-                    <title>{row.label}</title>
-                  </g>
-                );
-              })}
-            </svg>
+            {geoJson ? (
+              <svg viewBox="0 0 1000 520" role="img" aria-label="访问来源地图">
+                {geoJson.features.map((feature, index) => {
+                  const code = countryCode(feature.properties.ISO_A2 ?? null);
+                  const visits = countryStats.get(code) ?? 0;
+                  return (
+                    <path
+                      key={`${code}-${index}`}
+                      className={visits > 0 ? "geo-country active" : "geo-country"}
+                      d={featurePath(feature)}
+                      fill={countryFill(visits, maxCountry)}
+                      fillRule="evenodd"
+                    >
+                      <title>{`${countryName(code)} ${visits}`}</title>
+                    </path>
+                  );
+                })}
+              </svg>
+            ) : (
+              <div className="geo-loading">地图数据加载中</div>
+            )}
           </div>
           <div className="geo-side">
             <div className="segmented">

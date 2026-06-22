@@ -230,7 +230,7 @@ export function noRefererHtml(targetUrl: string): Response {
   const escaped = targetUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
   const scriptTarget = JSON.stringify(targetUrl);
   return new Response(
-    `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${escaped}"><title>Redirecting</title></head><body><script>window.location.replace(${scriptTarget});</script></body></html>`,
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Redirecting</title></head><body><script>window.location.replace(${scriptTarget});</script><noscript><meta http-equiv="refresh" content="0;url=${escaped}"></noscript></body></html>`,
     {
       status: 200,
       headers: {

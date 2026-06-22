@@ -953,34 +953,28 @@ form.panel {
 }
 
 .geo-map svg {
-  width: min(760px, 92%);
+  width: min(860px, 96%);
   height: auto;
 }
 
-.geo-land {
-  fill: #dce3ee;
+.geo-country {
   stroke: #ffffff;
   stroke-width: 0.45;
+  transition: fill 0.16s ease, opacity 0.16s ease;
 }
 
-.geo-line {
-  fill: none;
-  stroke: #eef2f7;
-  stroke-width: 0.25;
+.geo-country.active {
+  opacity: 0.92;
 }
 
-.geo-bubble {
-  opacity: 0.86;
-  stroke: #ffffff;
-  stroke-width: 0.7;
+.geo-country:hover {
+  opacity: 0.72;
 }
 
-.geo-bubble-0 { fill: #31b996; }
-.geo-bubble-1 { fill: #f4b740; }
-.geo-bubble-2 { fill: #f35f78; }
-.geo-bubble-3 { fill: #4c7ff0; }
-.geo-bubble-4 { fill: #6a55c6; }
-.geo-bubble-5 { fill: #75bd68; }
+.geo-loading {
+  color: #667085;
+  font-weight: 750;
+}
 
 .geo-side,
 .geo-list,

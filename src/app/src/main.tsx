@@ -379,6 +379,31 @@ function EmptyState({ title, text }: { title: string; text: string }) {
   );
 }
 
+type ResultSummaryItem = { ok: boolean; status?: string | null };
+
+function isProcessingStatus(status?: string | null): boolean {
+  return !status || ["queued", "running", "pending", "checking", "validating", "cloudflare_zone", "nameserver_update", "dns_configured", "route_configured", "waiting_nameserver"].includes(status);
+}
+
+function ResultSummary({ items, total }: { items: ResultSummaryItem[] | null; total?: number }) {
+  if (!items) {
+    return null;
+  }
+  const expected = Math.max(total ?? items.length, items.length);
+  const failed = items.filter((item) => !item.ok || item.status === "failed").length;
+  const processing = items.filter((item) => item.ok && isProcessingStatus(item.status)).length + Math.max(0, expected - items.length);
+  const success = items.filter((item) => item.ok && item.status !== "failed" && !isProcessingStatus(item.status)).length;
+  const processed = success + failed;
+  return (
+    <div className="result-summary">
+      <span>已处理 {processed} / {expected}</span>
+      <strong className="good">成功 {success}</strong>
+      <strong className="bad">失败 {failed}</strong>
+      <strong className="warn">处理中 {processing}</strong>
+    </div>
+  );
+}
+
 type GeoTab = "countries" | "regions" | "cities";
 type CountryMeta = { name: string; lat: number; lon: number };
 type GeoJsonGeometry = { type: "Polygon" | "MultiPolygon"; coordinates: number[][][] | number[][][][] };
@@ -1198,8 +1223,8 @@ function ShortLinksView({
   }
 
   return (
-    <section className="split">
-      <form className="panel" onSubmit={submit}>
+    <section className="short-links-page">
+      <form className="panel short-create-panel" onSubmit={submit}>
         <h2>生成短链接</h2>
         <label>
           目标服务
@@ -1238,7 +1263,7 @@ function ShortLinksView({
         {message && <div className="note">{message}</div>}
       </form>
 
-      <div className="panel">
+      <div className="panel short-list-panel">
         <div className="panel-head">
           <h2>短链接列表</h2>
           <button className="danger" disabled={selected.length === 0 || deleting} onClick={() => void deleteSelected()}>
@@ -1317,6 +1342,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
   const [newGroupName, setNewGroupName] = useState("");
   const [hideReferer, setHideReferer] = useState(true);
   const [result, setResult] = useState<CreateDomainResult[] | null>(() => loadStoredAddResults());
+  const [resultTotal, setResultTotal] = useState(() => loadStoredAddResults()?.length ?? 0);
   const [loading, setLoading] = useState(false);
   const [retryingIds, setRetryingIds] = useState<string[]>([]);
 
@@ -1418,6 +1444,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
         return;
       }
       const nextResults: CreateDomainResult[] = [];
+      setResultTotal(domainItems.length);
       setResult([]);
       for (const domain of domainItems) {
         const payload = domainPayload(domain);
@@ -1548,6 +1575,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
       <div className="panel">
         <div className="panel-head">
           <h2>处理结果</h2>
+          <ResultSummary items={result} total={resultTotal} />
           <button className="ghost" type="button" disabled={!result} onClick={() => setResult(null)}>
             <X size={16} />
             清空结果
@@ -2083,6 +2111,7 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
   const [domains, setDomains] = useState("");
   const [registrarId, setRegistrarId] = useState("dynadot");
   const [results, setResults] = useState<NameserverToolResult[] | null>(null);
+  const [resultTotal, setResultTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [retryingDomains, setRetryingDomains] = useState<string[]>([]);
@@ -2131,6 +2160,7 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
         return;
       }
       const nextResults: NameserverToolResult[] = [];
+      setResultTotal(domainItems.length);
       setResults([]);
       for (const domain of domainItems) {
         nextResults.push({ domain, ok: true, status: "queued", message: "处理中...", nameservers: [] });
@@ -2177,6 +2207,7 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
       <div className="panel">
         <div className="panel-head">
           <h2>处理结果</h2>
+          <ResultSummary items={results} total={resultTotal} />
           <button className="ghost" type="button" disabled={!results} onClick={() => setResults(null)}>
             <X size={16} />
             清空结果

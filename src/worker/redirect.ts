@@ -38,6 +38,47 @@ function clientFromUserAgent(userAgent: string | null): { operatingSystem: strin
   return { operatingSystem, browser, deviceType };
 }
 
+function getClientIp(request: Request): string | null {
+  const direct = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-real-ip");
+  if (direct) {
+    return direct.trim();
+  }
+  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  return forwarded || null;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function visitorKeyFromRequest(request: Request, env: Env, host: string): Promise<string> {
+  const ip = getClientIp(request);
+  const userAgent = request.headers.get("user-agent") ?? "";
+  const language = request.headers.get("accept-language") ?? "";
+  const cf = request.cf as Record<string, unknown> | undefined;
+  const fallback = [
+    "fallback",
+    host.toLowerCase(),
+    userAgent,
+    language,
+    typeof cf?.colo === "string" ? cf.colo : "",
+  ].join("|");
+  const source = ip ? `ip|${ip}` : fallback;
+  return sha256Hex(`${env.SESSION_SECRET ?? "link-shortener-visitor-v1"}|${source}`);
+}
+
+function isLikelyBotRequest(request: Request): boolean {
+  const cf = request.cf as Record<string, unknown> | undefined;
+  const botManagement = cf?.botManagement as Record<string, unknown> | undefined;
+  if (botManagement?.verifiedBot === true) {
+    return true;
+  }
+  const ua = request.headers.get("user-agent")?.toLowerCase() ?? "";
+  return /bot|crawler|spider|slurp|bingpreview|facebookexternalhit|twitterbot|linkedinbot|discordbot|telegrambot|whatsapp|preview|monitor|uptime|pingdom/.test(ua);
+}
+
 const IGNORED_PAGE_VIEW_PATHS = new Set([
   "/favicon.ico",
   "/robots.txt",
@@ -51,6 +92,9 @@ const IGNORED_PAGE_VIEW_PATHS = new Set([
 
 export function shouldRecordPageView(request: Request): boolean {
   if (request.method !== "GET" && request.method !== "HEAD") {
+    return false;
+  }
+  if (isLikelyBotRequest(request)) {
     return false;
   }
   const url = new URL(request.url);
@@ -113,6 +157,8 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
         userAgent,
         targetHost: domain.redirectMode === "direct" ? domain.directTargetHost ?? domain.targetHost : domain.targetHost,
         hideReferer: domain.hideReferer,
+        visitorKey: await visitorKeyFromRequest(request, env, host),
+        isBot: isLikelyBotRequest(request),
       }),
     );
   }

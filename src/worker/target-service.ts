@@ -1,5 +1,5 @@
 import { findDomainForwardTarget, findShortLinkByCode, findTargetByHost, recordShortLinkVisit } from "./db";
-import { shouldRecordPageView } from "./redirect";
+import { shouldRecordPageView, visitorKeyFromRequest } from "./redirect";
 import { buildTargetUrl, noRefererHtml, noRefererRedirect } from "./shared";
 
 function html(targetHost: string): string {
@@ -57,7 +57,7 @@ export async function handleTargetService(request: Request, env: Env): Promise<R
     const shortLink = await findShortLinkByCode(env.DB, target.targetHost, shortCodeMatch[1]);
     if (shortLink) {
       if (shouldRecordPageView(request)) {
-        await recordShortLinkVisit(env.DB, shortLink.id);
+        await recordShortLinkVisit(env.DB, shortLink.id, await visitorKeyFromRequest(request, env, host));
       }
       if (shortLink.hideReferer && request.method === "GET") {
         return noRefererHtml(shortLink.originalUrl);

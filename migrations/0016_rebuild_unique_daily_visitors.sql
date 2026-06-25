@@ -1,22 +1,4 @@
-ALTER TABLE visit_events ADD COLUMN visitor_key TEXT;
-ALTER TABLE visit_events ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS visit_daily_uniques (
-  redirect_domain_id TEXT NOT NULL REFERENCES redirect_domains(id) ON DELETE CASCADE,
-  day TEXT NOT NULL,
-  visitor_key TEXT NOT NULL,
-  PRIMARY KEY (redirect_domain_id, day, visitor_key)
-);
-
-CREATE TABLE IF NOT EXISTS short_link_daily_uniques (
-  short_link_id TEXT NOT NULL REFERENCES short_links(id) ON DELETE CASCADE,
-  day TEXT NOT NULL,
-  visitor_key TEXT NOT NULL,
-  PRIMARY KEY (short_link_id, day, visitor_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_visit_daily_uniques_day ON visit_daily_uniques(day);
-CREATE INDEX IF NOT EXISTS idx_short_link_daily_uniques_day ON short_link_daily_uniques(day);
+DELETE FROM visit_daily_uniques;
 
 INSERT OR IGNORE INTO visit_daily_uniques (redirect_domain_id, day, visitor_key)
 SELECT
@@ -30,7 +12,7 @@ SELECT
     lower(COALESCE(referer, ''))
   ) AS visitor_key
 FROM visit_events
-WHERE is_bot = 0
+WHERE COALESCE(is_bot, 0) = 0
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*bot*'
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*crawler*'
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*spider*'
@@ -79,7 +61,7 @@ SELECT
   COUNT(DISTINCT COALESCE(NULLIF(referer, ''), 'direct')) AS unique_referers,
   MAX(visited_at) AS last_accessed_at
 FROM visit_events
-WHERE is_bot = 0
+WHERE COALESCE(is_bot, 0) = 0
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*bot*'
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*crawler*'
 AND lower(COALESCE(user_agent, '')) NOT GLOB '*spider*'

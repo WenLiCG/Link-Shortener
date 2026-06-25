@@ -84,8 +84,7 @@ const VISITOR_ID_SQL = `COALESCE(
   lower(COALESCE(country, '')) || '|' ||
   lower(COALESCE(city, '')) || '|' ||
   lower(COALESCE(user_agent, '')) || '|' ||
-  lower(COALESCE(referer, '')) || '|' ||
-  lower(COALESCE(path, ''))
+  lower(COALESCE(referer, ''))
 )`;
 
 function sleep(ms: number): Promise<void> {
@@ -820,8 +819,17 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const recentVisits = (
     await all(
       db,
-      `SELECT * FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `WITH ranked_visits AS (
+         SELECT *,
+           ROW_NUMBER() OVER (
+             PARTITION BY date(visited_at), ${VISITOR_ID_SQL}
+             ORDER BY visited_at DESC
+           ) AS visit_rank
+         FROM visit_events
+         WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+       )
+       SELECT * FROM ranked_visits
+       WHERE visit_rank = 1
        ORDER BY visited_at DESC
        LIMIT 50`,
       id,

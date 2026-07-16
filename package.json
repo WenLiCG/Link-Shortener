@@ -8,7 +8,9 @@
     "worker:dev": "wrangler dev --local --port 8787",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "vitest run",
+    "test": "vitest run --config vitest.config.ts",
+    "test:worker": "vitest run --config vitest.worker.config.ts",
+    "test:all": "npm run test && npm run test:worker",
     "typecheck": "tsc -b --pretty false",
     "wrangler:check": "wrangler deploy --dry-run",
     "wrangler:types": "wrangler types src/worker/worker-configuration.d.ts",
@@ -22,13 +24,14 @@
     "react-dom": "^19.2.1"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.5",
     "@cloudflare/workers-types": "^4.20260613.1",
     "@types/node": "^24.10.2",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "typescript": "^5.9.3",
     "vite": "^7.2.7",
-    "vitest": "^4.0.15",
+    "vitest": "^4.1.0",
     "wrangler": "^4.54.0"
   }
 }

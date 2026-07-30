@@ -1,7 +1,8 @@
 import { ensureWorkerDnsRecordForHost, ensureWorkerRouteForHost, findBestZoneForHost, ensureZone, getZone } from "./cloudflare";
-import { getTargetById, updateTargetAutomation, withOperationLock } from "./db";
+import { getTargetById, updateTargetAutomation } from "./db";
 import { isDomainInDynadot, setNameservers } from "./dynadot";
 import { secret } from "./env-utils";
+import { ProviderError } from "./provider-error";
 import { refreshTargetHealth } from "./target-health";
 
 function isApexOfZone(host: string, zoneName: string): boolean {
@@ -9,10 +10,6 @@ function isApexOfZone(host: string, zoneName: string): boolean {
 }
 
 export async function repairTargetService(env: Env, targetId: string): Promise<void> {
-  return withOperationLock(env.DB, () => repairTargetServiceUnlocked(env, targetId));
-}
-
-async function repairTargetServiceUnlocked(env: Env, targetId: string): Promise<void> {
   const target = await getTargetById(env.DB, targetId);
   if (!target) {
     return;
@@ -42,19 +39,21 @@ async function repairTargetServiceUnlocked(env: Env, targetId: string): Promise<
       if (zone.nameServers.length === 0) {
         throw new Error("Cloudflare 未返回 Nameserver。");
       }
-      const ownedByDynadot = await isDomainInDynadot(env, target.targetHost);
-      if (ownedByDynadot) {
-        await setNameservers(env, target.targetHost, zone.nameServers);
-        await updateTargetAutomation(env.DB, target.id, {
-          nameserverStatus: "submitted",
-          dynadotStatus: "updated",
-        });
-      } else {
-        const hasDynadotKey = Boolean(secret(env, "DYNADOT_API_KEY"));
-        await updateTargetAutomation(env.DB, target.id, {
-          nameserverStatus: hasDynadotKey ? "manual_required" : "skipped_missing_key",
-          dynadotStatus: hasDynadotKey ? "not_found" : "skipped_missing_key",
-        });
+      if (!["submitted", "active", "waiting"].includes(target.nameserverStatus)) {
+        const ownedByDynadot = await isDomainInDynadot(env, target.targetHost);
+        if (ownedByDynadot) {
+          await setNameservers(env, target.targetHost, zone.nameServers);
+          await updateTargetAutomation(env.DB, target.id, {
+            nameserverStatus: "submitted",
+            dynadotStatus: "updated",
+          });
+        } else {
+          const hasDynadotKey = Boolean(secret(env, "DYNADOT_API_KEY"));
+          await updateTargetAutomation(env.DB, target.id, {
+            nameserverStatus: hasDynadotKey ? "manual_required" : "skipped_missing_key",
+            dynadotStatus: hasDynadotKey ? "not_found" : "skipped_missing_key",
+          });
+        }
       }
     } else {
       await updateTargetAutomation(env.DB, target.id, {
@@ -81,13 +80,20 @@ async function repairTargetServiceUnlocked(env: Env, targetId: string): Promise<
       lastCheckedAt: new Date().toISOString(),
     });
 
+    if (latestZone.status !== "active") {
+      throw new ProviderError("cloudflare", null, "nameserver_pending", true, "等待 Nameserver 生效。");
+    }
     await refreshTargetHealth(env, target.id);
   } catch (error) {
+    const waiting = error instanceof ProviderError && error.code === "nameserver_pending";
     await updateTargetAutomation(env.DB, target.id, {
-      automationStatus: "failed",
-      lastError: error instanceof Error ? error.message : "目标服务自动化失败。",
+      automationStatus: waiting ? "waiting_nameserver" : "failed",
+      lastError: error instanceof ProviderError ? error.message : "目标服务自动化失败。",
       lastCheckedAt: new Date().toISOString(),
     });
-    await refreshTargetHealth(env, target.id);
+    if (!waiting) {
+      await refreshTargetHealth(env, target.id);
+    }
+    throw error;
   }
 }

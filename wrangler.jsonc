@@ -31,7 +31,7 @@
     }
   ],
   "triggers": {
-    "crons": ["*/15 * * * *"]
+    "crons": ["* * * * *"]
   },
   "vars": {
     "ADMIN_HOST": "admin.example.com",

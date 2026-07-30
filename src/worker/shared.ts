@@ -122,13 +122,43 @@ export interface JobStep {
   createdAt: string;
 }
 
+export type JobStatus = "queued" | "running" | "retry_wait" | "completed" | "failed";
+
+export type JobType =
+  | "domain_provision"
+  | "domain_retry"
+  | "domain_delete"
+  | "target_repair"
+  | "target_delete"
+  | "nameserver_connect"
+  | "zone_delete";
+
+export interface EnqueueJobInput {
+  type: JobType;
+  subjectType: "redirect_domain" | "target_service" | "domain";
+  subjectId: string;
+  redirectDomainId?: string;
+  payload: Record<string, unknown>;
+  idempotencyKey: string;
+  maxAttempts?: number;
+}
+
 export interface DomainJob {
   id: string;
-  redirectDomainId: string;
-  type: string;
-  status: string;
+  redirectDomainId: string | null;
+  type: JobType;
+  subjectType: EnqueueJobInput["subjectType"];
+  subjectId: string;
+  payload: Record<string, unknown>;
+  idempotencyKey: string;
+  status: JobStatus;
   currentStep: string;
   errorMessage: string | null;
+  attemptCount: number;
+  maxAttempts: number;
+  nextAttemptAt: string;
+  leaseToken: string | null;
+  leaseExpiresAt: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;

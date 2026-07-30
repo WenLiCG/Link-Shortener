@@ -8,20 +8,19 @@ import {
   requireSession,
   verifyPassword,
 } from "./auth";
-import { processDomainJob } from "./automation";
-import { deleteZoneByName, ensureZone, listZones } from "./cloudflare";
+import { processNextJob } from "./automation";
+import { listZones } from "./cloudflare";
 import {
   createShortLink,
   createRedirectDomain,
   createTarget,
-  countDomainsForTarget,
-  countShortLinksForTarget,
-  deleteTarget,
-  deleteDomains,
   deleteShortLinks,
+  enqueueJob,
   ensureGroup,
   findDomainByName,
+  findTargetByHost,
   getDomainDetail,
+  getJobById,
   getTargetById,
   listDomains,
   listGroups,
@@ -33,14 +32,11 @@ import {
   shortLinkCodeExists,
   summaryStats,
   updateTargetForward,
-  withOperationLock,
 } from "./db";
-import { isDomainInDynadot, setNameservers } from "./dynadot";
 import { HttpError, fail, ok, readJson } from "./http";
 import { configuredValue, hasConfiguredValue, secret } from "./env-utils";
 import { ProviderError } from "./provider-error";
 import { type RedirectMode, isValidDomain, normalizeDomain } from "./shared";
-import { repairTargetService } from "./target-automation";
 import { refreshTargetHealth } from "./target-health";
 
 interface LoginBody {
@@ -217,11 +213,15 @@ async function registrarStatus(env: Env) {
   };
 }
 
-async function runNameserverTool(env: Env, input: NameserverToolBody) {
-  return withOperationLock(env.DB, () => runNameserverToolUnlocked(env, input));
+function idempotencyKey(request: Request, prefix: string, fallback: string): string {
+  const supplied = request.headers.get("idempotency-key")?.trim();
+  if (supplied && !/^[A-Za-z0-9._:-]{1,128}$/.test(supplied)) {
+    throw new HttpError(400, "bad_request", "Idempotency-Key 格式不合法。");
+  }
+  return `${prefix}:${supplied || fallback}`;
 }
 
-async function runNameserverToolUnlocked(env: Env, input: NameserverToolBody) {
+async function enqueueNameserverJob(env: Env, request: Request, input: NameserverToolBody) {
   const registrarId = input.registrarId || "manual";
   const domains = splitDomains(input.domains);
   if (domains.length === 0) {
@@ -230,69 +230,30 @@ async function runNameserverToolUnlocked(env: Env, input: NameserverToolBody) {
   if (domains.length > 1) {
     throw new HttpError(400, "bad_request", "该接口一次只处理一个域名，请由前端逐个提交。");
   }
-  const results: Array<{ domain: string; ok: boolean; status: string; message: string; nameservers: string[]; zoneStatus?: string }> = [];
-  for (const rawDomain of domains) {
-    const domain = normalizeDomain(rawDomain);
-    if (!isValidDomain(domain)) {
-      results.push({ domain: rawDomain, ok: false, status: "failed", message: "域名格式不合法。", nameservers: [] });
-      continue;
-    }
-    try {
-      const zone = await ensureZone(env, domain);
-      if (zone.nameServers.length === 0) {
-        results.push({ domain, ok: false, status: "failed", message: "Cloudflare 未返回 Nameserver。", nameservers: [], zoneStatus: zone.status });
-        continue;
-      }
-      if (registrarId === "dynadot") {
-        const owned = await isDomainInDynadot(env, domain);
-        if (!owned) {
-          results.push({
-            domain,
-            ok: false,
-            status: "manual_required",
-            message: "Dynadot 未找到该域名，请复制下方 Nameserver 到当前注册商后台手动设置。",
-            nameservers: zone.nameServers,
-            zoneStatus: zone.status,
-          });
-          continue;
-        }
-        await setNameservers(env, domain, zone.nameServers);
-        results.push({
-          domain,
-          ok: true,
-          status: "submitted",
-          message: "已提交 Dynadot set_ns，等待注册商和 Cloudflare 生效。",
-          nameservers: zone.nameServers,
-          zoneStatus: zone.status,
-        });
-        continue;
-      }
-      results.push({
-        domain,
-        ok: true,
-        status: "manual_required",
-        message: "已添加/确认 Cloudflare Zone。请复制 Nameserver 到注册商后台手动设置。",
-        nameservers: zone.nameServers,
-        zoneStatus: zone.status,
-      });
-    } catch (error) {
-      results.push({
-        domain,
-        ok: false,
-        status: "failed",
-        message: error instanceof ProviderError ? error.message : "处理失败。",
-        nameservers: [],
-      });
-    }
+  const domain = normalizeDomain(domains[0]);
+  if (!isValidDomain(domain)) {
+    throw new HttpError(400, "bad_request", "域名格式不合法。");
   }
-  return { results };
+  const job = await enqueueJob(env.DB, {
+    type: "nameserver_connect",
+    subjectType: "domain",
+    subjectId: domain,
+    payload: { domain, registrarId },
+    idempotencyKey: idempotencyKey(request, "nameserver_connect", `${domain}:${registrarId}:${Math.floor(Date.now() / 30_000)}`),
+  });
+  return {
+    results: [{
+      domain,
+      ok: true,
+      status: job.status,
+      jobId: job.id,
+      message: "已加入串行处理队列。",
+      nameservers: [],
+    }],
+  };
 }
 
-async function deleteCloudflareZones(env: Env, input: DeleteCloudflareZonesBody) {
-  return withOperationLock(env.DB, () => deleteCloudflareZonesUnlocked(env, input));
-}
-
-async function deleteCloudflareZonesUnlocked(env: Env, input: DeleteCloudflareZonesBody) {
+async function enqueueCloudflareZoneDelete(env: Env, request: Request, input: DeleteCloudflareZonesBody) {
   if (!input.confirmDelete) {
     throw new HttpError(400, "bad_request", "请确认删除 Cloudflare Zone。");
   }
@@ -303,32 +264,26 @@ async function deleteCloudflareZonesUnlocked(env: Env, input: DeleteCloudflareZo
   if (domains.length > 1) {
     throw new HttpError(400, "bad_request", "该接口一次只处理一个域名，请由前端逐个提交。");
   }
-  const results: Array<{ domain: string; ok: boolean; status: string; message: string; zoneId?: string }> = [];
-  for (const rawDomain of domains) {
-    const domain = normalizeDomain(rawDomain);
-    if (!isValidDomain(domain)) {
-      results.push({ domain: rawDomain, ok: false, status: "failed", message: "域名格式不合法。" });
-      continue;
-    }
-    try {
-      const result = await deleteZoneByName(env, domain);
-      results.push({
-        domain,
-        ok: result.deleted || result.status === "not_found",
-        status: result.status,
-        message: result.message,
-        zoneId: result.zoneId,
-      });
-    } catch (error) {
-      results.push({
-        domain,
-        ok: false,
-        status: "failed",
-        message: error instanceof ProviderError ? error.message : "删除失败。",
-      });
-    }
+  const domain = normalizeDomain(domains[0]);
+  if (!isValidDomain(domain)) {
+    throw new HttpError(400, "bad_request", "域名格式不合法。");
   }
-  return { results };
+  const job = await enqueueJob(env.DB, {
+    type: "zone_delete",
+    subjectType: "domain",
+    subjectId: domain,
+    payload: { domain },
+    idempotencyKey: idempotencyKey(request, "zone_delete", `${domain}:${Math.floor(Date.now() / 30_000)}`),
+  });
+  return {
+    results: [{
+      domain,
+      ok: true,
+      status: job.status,
+      jobId: job.id,
+      message: "已加入串行删除队列。",
+    }],
+  };
 }
 
 export async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -458,7 +413,9 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 
   if (pathname === "/api/nameserver-tool") {
     assertMethod(request, "POST");
-    return ok(await runNameserverTool(env, await readJson<NameserverToolBody>(request)));
+    const result = await enqueueNameserverJob(env, request, await readJson<NameserverToolBody>(request));
+    ctx.waitUntil(processNextJob(env));
+    return ok(result, { status: 202 });
   }
 
   if (pathname === "/api/cloudflare-zones" && request.method === "GET") {
@@ -467,7 +424,23 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 
   if (pathname === "/api/cloudflare-zones/delete") {
     assertMethod(request, "POST");
-    return ok(await deleteCloudflareZones(env, await readJson<DeleteCloudflareZonesBody>(request)));
+    const result = await enqueueCloudflareZoneDelete(env, request, await readJson<DeleteCloudflareZonesBody>(request));
+    ctx.waitUntil(processNextJob(env));
+    return ok(result, { status: 202 });
+  }
+
+  const jobMatch = pathname.match(/^\/api\/jobs\/([^/]+)$/);
+  if (jobMatch) {
+    assertMethod(request, "GET");
+    const job = await getJobById(env.DB, jobMatch[1]);
+    if (!job) {
+      throw new HttpError(404, "not_found", "任务不存在。");
+    }
+    if (job.status === "queued" || job.status === "retry_wait") {
+      ctx.waitUntil(processNextJob(env));
+    }
+    const { leaseToken: _leaseToken, leaseExpiresAt: _leaseExpiresAt, ...publicJob } = job;
+    return ok(publicJob);
   }
 
   if (pathname === "/api/targets") {
@@ -487,14 +460,20 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       if (forwardTargetHost && !isValidDomain(forwardTargetHost)) {
         throw new HttpError(400, "bad_request", "最终跳转域名不合法。");
       }
-      const target = await createTarget(env.DB, {
+      if (await findDomainByName(env.DB, targetHost)) {
+        throw new HttpError(409, "conflict", "域名不能同时作为入口域名和目标服务域名。");
+      }
+      if (await findTargetByHost(env.DB, targetHost)) {
+        throw new HttpError(409, "conflict", "目标服务域名已存在。");
+      }
+      const created = await createTarget(env.DB, {
         name: body.name.trim(),
         targetHost,
         forwardTargetHost,
         description: body.description?.trim() ?? "",
       });
-      ctx.waitUntil(repairTargetService(env, target.id));
-      return ok(target, { status: 201 });
+      ctx.waitUntil(processNextJob(env));
+      return ok({ ...created.target, jobId: created.jobId, jobStatus: "queued" }, { status: 202 });
     }
   }
 
@@ -510,7 +489,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (forwardTargetHost && !isValidDomain(forwardTargetHost)) {
       throw new HttpError(400, "bad_request", "最终跳转域名不合法。");
     }
-    await withOperationLock(env.DB, () => updateTargetForward(env.DB, target.id, forwardTargetHost));
+    await updateTargetForward(env.DB, target.id, forwardTargetHost);
     return ok({ id: target.id, forwardTargetHost });
   }
 
@@ -520,15 +499,15 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (!target) {
       throw new HttpError(404, "not_found", "目标服务不存在。");
     }
-    const domainCount = await countDomainsForTarget(env.DB, target.id);
-    const shortLinkCount = await countShortLinksForTarget(env.DB, target.id);
-    const result = await withOperationLock(env.DB, () => deleteTarget(env.DB, target.id, target.targetHost));
-    return ok({
-      deleted: result.deleted,
-      id: target.id,
-      domainsMarked: result.domainsMarked || domainCount,
-      shortLinksDeleted: result.shortLinksDeleted || shortLinkCount,
+    const job = await enqueueJob(env.DB, {
+      type: "target_delete",
+      subjectType: "target_service",
+      subjectId: target.id,
+      payload: { targetHost: target.targetHost },
+      idempotencyKey: idempotencyKey(request, "target_delete", target.id),
     });
+    ctx.waitUntil(processNextJob(env));
+    return ok({ id: target.id, jobId: job.id, status: job.status }, { status: 202 });
   }
 
   if (pathname === "/api/short-links") {
@@ -580,8 +559,25 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       throw new HttpError(404, "not_found", "目标服务不存在。");
     }
     await markTargetHealthChecking(env.DB, target.id);
-    ctx.waitUntil(repairTargetService(env, target.id));
-    return ok({ id: target.id, automationStatus: "cloudflare_zone", healthStatus: "checking" });
+    const job = await enqueueJob(env.DB, {
+      type: "target_repair",
+      subjectType: "target_service",
+      subjectId: target.id,
+      payload: {},
+      idempotencyKey: idempotencyKey(
+        request,
+        "target_repair",
+        `${target.id}:${target.lastCheckedAt ?? target.updatedAt}`,
+      ),
+    });
+    ctx.waitUntil(processNextJob(env));
+    return ok({
+      id: target.id,
+      jobId: job.id,
+      status: job.status,
+      automationStatus: "cloudflare_zone",
+      healthStatus: "checking",
+    }, { status: 202 });
   }
 
   if (pathname === "/api/groups") {
@@ -646,10 +642,24 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
           results.push({ domain, ok: false, error: "域名格式不合法。" });
           continue;
         }
+        if (await findTargetByHost(env.DB, domain)) {
+          throw new HttpError(409, "conflict", "域名不能同时作为入口域名和目标服务域名。");
+        }
         const existing = await findDomainByName(env.DB, domain);
         if (existing) {
           if (!existing.listVisible) {
-            await deleteDomains(env.DB, [existing.id]);
+            const detail = await getDomainDetail(env.DB, existing.id);
+            const pendingJob = detail?.jobs.find((job) => (
+              job.status === "queued" || job.status === "running" || job.status === "retry_wait"
+            ));
+            const job = pendingJob ?? await retryDomain(
+              env.DB,
+              existing.id,
+              `domain_retry:${existing.id}:${existing.lastCheckedAt ?? existing.createdAt}`,
+            );
+            ctx.waitUntil(processNextJob(env));
+            results.push({ domain, ok: true, id: existing.id, jobId: job.id });
+            continue;
           } else {
             results.push({ domain, ok: false, error: "域名已存在。" });
             continue;
@@ -665,7 +675,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
             groupId,
             hideReferer: Boolean(body.hideReferer),
           });
-          ctx.waitUntil(processDomainJob(env, created.domain.id, created.jobId));
+          ctx.waitUntil(processNextJob(env));
           results.push({ domain, ok: true, id: created.domain.id, jobId: created.jobId });
         } catch (error) {
           results.push({
@@ -675,7 +685,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
           });
         }
       }
-      return ok({ results }, { status: 201 });
+      return ok({ results }, { status: 202 });
     }
     if (request.method === "DELETE") {
       const body = await readJson<DeleteDomainsBody>(request);
@@ -685,9 +695,24 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       if (body.ids.length > 1) {
         throw new HttpError(400, "bad_request", "该接口一次只删除一个域名，请由前端逐个提交。");
       }
-      const deleted = await deleteDomains(env.DB, body.ids);
+      const id = body.ids[0];
+      const job = await enqueueJob(env.DB, {
+        type: "domain_delete",
+        subjectType: "redirect_domain",
+        subjectId: id,
+        redirectDomainId: id,
+        payload: {
+          cleanupRoutes: Boolean(body.cleanupRoutes),
+          cleanupDns: Boolean(body.cleanupDns),
+          cleanupZone: Boolean(body.cleanupZone),
+        },
+        idempotencyKey: idempotencyKey(request, "domain_delete", id),
+      });
+      ctx.waitUntil(processNextJob(env));
       return ok({
-        deleted,
+        deleted: 0,
+        jobId: job.id,
+        status: job.status,
         cleanup: {
           routes: Boolean(body.cleanupRoutes),
           dns: Boolean(body.cleanupDns),
@@ -695,7 +720,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
           performed: false,
           message: "V1 默认仅删除系统内配置；Cloudflare 清理选项已预留但不会自动执行。",
         },
-      });
+      }, { status: 202 });
     }
   }
 
@@ -716,9 +741,13 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (!detail) {
       throw new HttpError(404, "not_found", "域名不存在。");
     }
-    const jobId = await retryDomain(env.DB, retryMatch[1]);
-    ctx.waitUntil(processDomainJob(env, retryMatch[1], jobId));
-    return ok({ jobId });
+    const job = await retryDomain(
+      env.DB,
+      retryMatch[1],
+      `domain_retry:${detail.id}:${detail.lastCheckedAt ?? detail.createdAt}`,
+    );
+    ctx.waitUntil(processNextJob(env));
+    return ok({ jobId: job.id, status: job.status }, { status: 202 });
   }
 
   if (pathname === "/api/stats/summary") {

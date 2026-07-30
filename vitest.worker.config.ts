@@ -15,6 +15,8 @@ export default defineConfig({
           ADMIN_HOST: "admin.example.com",
           SESSION_SECRET: "test-session-secret",
           PASSWORD_PEPPER: "test-password-pepper",
+          CLOUDFLARE_ACCOUNT_ID: "test-account",
+          CLOUDFLARE_API_TOKEN: "test-cloudflare-token",
           VISITOR_HASH_SECRET: "test-visitor-secret",
           VERIFICATION_SIGNING_SECRET: "test-verification-secret",
           TURNSTILE_SITE_KEY: "1x00000000000000000000BB",

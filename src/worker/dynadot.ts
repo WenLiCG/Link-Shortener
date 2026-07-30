@@ -13,7 +13,7 @@ async function endpoint(env: Env): Promise<string> {
 }
 
 async function dynadotRequest(env: Env, params: Record<string, string>): Promise<DynadotResponse> {
-  const apiKey = await configuredValue(env, "DYNADOT_API_KEY");
+  const apiKey = secret(env, "DYNADOT_API_KEY");
   if (!apiKey) {
     throw new Error("缺少 DYNADOT_API_KEY。");
   }
@@ -42,7 +42,7 @@ function getStatus(body: DynadotResponse): { ok: boolean; message: string } {
 }
 
 export async function isDomainInDynadot(env: Env, domain: string): Promise<boolean> {
-  if (!(await configuredValue(env, "DYNADOT_API_KEY"))) {
+  if (!secret(env, "DYNADOT_API_KEY")) {
     return false;
   }
   const body = await dynadotRequest(env, { command: "domain_info", domain });
@@ -64,4 +64,4 @@ export async function setNameservers(env: Env, domain: string, nameservers: stri
     throw new Error(status.message);
   }
 }
-import { configuredValue } from "./env-utils";
+import { configuredValue, secret } from "./env-utils";

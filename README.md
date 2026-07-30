@@ -17,10 +17,11 @@ A Cloudflare-native redirect management app for operating many entry domains fro
 
 ## Security Notice
 
-Do not commit secrets. Keep these values only in Cloudflare secrets, D1 settings, or local `.dev.vars`:
+Do not commit secrets. Keep provider credentials only in Cloudflare Worker Secrets or local `.dev.vars`:
 
 - `ADMIN_PASSWORD_HASH`
 - `SESSION_SECRET`
+- `PASSWORD_PEPPER`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_API_TOKEN`
 - `DYNADOT_API_KEY`
@@ -76,6 +77,8 @@ Generate an admin password hash:
 node -e "crypto.subtle.digest('SHA-256', new TextEncoder().encode('your-password')).then(b=>console.log([...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')))"
 ```
 
+This SHA-256 value is accepted only as a one-time bootstrap format when `PASSWORD_PEPPER` is configured. The first successful login replaces it in D1 with a salted PBKDF2 hash.
+
 Fill `.dev.vars` with your local values, then run:
 
 ```bash
@@ -97,6 +100,21 @@ Run the Vite admin UI:
 npm run dev
 ```
 
+## Production Secrets
+
+Set production secrets with Wrangler:
+
+```bash
+npx wrangler secret put ADMIN_PASSWORD_HASH
+npx wrangler secret put SESSION_SECRET
+npx wrangler secret put PASSWORD_PEPPER
+npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+npx wrangler secret put CLOUDFLARE_API_TOKEN
+npx wrangler secret put DYNADOT_API_KEY
+```
+
+`DYNADOT_API_KEY` is optional if you only want manual nameserver instructions. Provider credentials cannot be edited in the admin UI and are never stored in D1.
+
 ## D1 Migrations
 
 Apply migrations locally:
@@ -105,25 +123,13 @@ Apply migrations locally:
 npx wrangler d1 migrations apply multi-domain-redirect-manager --local
 ```
 
-Apply migrations to Cloudflare:
+For an existing deployment, configure all production secrets above and deploy the updated Worker before applying remote migrations. Confirm the initialization check can read Cloudflare and Dynadot configuration, then run:
 
 ```bash
 npx wrangler d1 migrations apply multi-domain-redirect-manager --remote
 ```
 
-## Production Secrets
-
-Set production secrets with Wrangler:
-
-```bash
-npx wrangler secret put ADMIN_PASSWORD_HASH
-npx wrangler secret put SESSION_SECRET
-npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
-npx wrangler secret put CLOUDFLARE_API_TOKEN
-npx wrangler secret put DYNADOT_API_KEY
-```
-
-`DYNADOT_API_KEY` is optional if you only want manual nameserver instructions.
+Migration `0017` removes legacy provider credentials from D1, so applying it before the Worker reads Wrangler Secrets can interrupt automation.
 
 ## Cloudflare API Token Permissions
 
@@ -182,7 +188,7 @@ Failed or timed-out items stay visible in the result panel with a manual retry b
 Before publishing:
 
 ```bash
-rg -n --hidden --glob '!node_modules/**' --glob '!dist/**' --glob '!.wrangler/**' --glob '!.git/**' "cfut_|CLOUDFLARE_API_TOKEN|DYNADOT_API_KEY|ADMIN_PASSWORD_HASH|SESSION_SECRET|your-real-domain|your-real-database-id" .
+rg -n --hidden --glob '!node_modules/**' --glob '!dist/**' --glob '!.wrangler/**' --glob '!.git/**' "cfut_|CLOUDFLARE_API_TOKEN|DYNADOT_API_KEY|ADMIN_PASSWORD_HASH|SESSION_SECRET|PASSWORD_PEPPER|your-real-domain|your-real-database-id" .
 ```
 
 Confirm that `.dev.vars`, logs, `dist`, `.wrangler`, and `node_modules` are not staged.

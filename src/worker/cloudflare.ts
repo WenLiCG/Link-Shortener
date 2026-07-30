@@ -17,7 +17,7 @@ interface CloudflareApiResponse<T> {
 }
 
 async function cfHeaders(env: Env): Promise<HeadersInit> {
-  const token = await configuredValue(env, "CLOUDFLARE_API_TOKEN");
+  const token = secret(env, "CLOUDFLARE_API_TOKEN");
   if (!token) {
     throw new Error("缺少 CLOUDFLARE_API_TOKEN。");
   }
@@ -93,7 +93,7 @@ export async function ensureZone(env: Env, domain: string): Promise<CloudflareZo
   if (existing.length > 0) {
     return mapZone(existing[0]);
   }
-  const accountId = await configuredValue(env, "CLOUDFLARE_ACCOUNT_ID");
+  const accountId = secret(env, "CLOUDFLARE_ACCOUNT_ID");
   if (!accountId) {
     throw new Error("缺少 CLOUDFLARE_ACCOUNT_ID。");
   }
@@ -264,4 +264,4 @@ export async function deleteZoneByName(env: Env, domain: string): Promise<{ dele
   await cfRequest(env, `/zones/${zone.id}`, { method: "DELETE" });
   return { deleted: true, zoneId: zone.id, status: "deleted", message: "已删除 Cloudflare Zone。" };
 }
-import { configuredValue } from "./env-utils";
+import { secret } from "./env-utils";

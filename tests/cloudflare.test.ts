@@ -16,6 +16,19 @@ const env = {
   WORKER_SCRIPT_NAME: "link-shortener-manager",
 } satisfies Env;
 
+function envWithStoredValue(value: string): Env {
+  return {
+    ...env,
+    DB: {
+      prepare: () => ({
+        bind: () => ({
+          first: async () => ({ value }),
+        }),
+      }),
+    } as unknown as D1Database,
+  };
+}
+
 describe("cloudflare client", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -30,6 +43,21 @@ describe("cloudflare client", () => {
     );
     await expect(ensureZone(env, "example.com")).resolves.toMatchObject({ id: "zone-1", nameServers: ["a.ns", "b.ns"] });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses Worker secrets instead of legacy D1 credential values", async () => {
+    const requests: Request[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      requests.push(new Request(input, init));
+      return requests.length === 1
+        ? jsonResponse({ success: true, result: [] })
+        : jsonResponse({ success: true, result: { id: "zone-1", name: "example.com", status: "pending", name_servers: [] } });
+    });
+
+    await ensureZone(envWithStoredValue("stale-d1-value"), "example.com");
+
+    expect(requests[0].headers.get("authorization")).toBe("Bearer token");
+    expect(await requests[1].json()).toMatchObject({ account: { id: "account" } });
   });
 
   it("creates missing dns records", async () => {

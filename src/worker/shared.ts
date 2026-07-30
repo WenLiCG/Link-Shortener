@@ -16,6 +16,7 @@ export type ApiErrorCode =
   | "bad_request"
   | "unauthorized"
   | "forbidden"
+  | "rate_limited"
   | "not_found"
   | "conflict"
   | "server_error";

@@ -1,4 +1,13 @@
-import { clearSessionCookie, createSessionCookie, hashPasswordForDocs, requireSession, verifyPassword } from "./auth";
+import {
+  assertLoginAllowed,
+  clearLoginFailures,
+  clearSessionCookie,
+  createSessionCookie,
+  hashPasswordForDocs,
+  recordLoginFailure,
+  requireSession,
+  verifyPassword,
+} from "./auth";
 import { processDomainJob } from "./automation";
 import { deleteZoneByName, ensureZone, listZones } from "./cloudflare";
 import {
@@ -43,9 +52,6 @@ interface ChangePasswordBody {
 }
 
 interface UpdateRegistrarSettingsBody {
-  cloudflareAccountId?: string;
-  cloudflareApiToken?: string;
-  dynadotApiKey?: string;
   dynadotSandbox?: boolean;
 }
 
@@ -189,14 +195,14 @@ async function registrarStatus(env: Env) {
         name: "Cloudflare",
         role: "DNS / Zone / Nameserver 来源",
         automation: "已支持：创建/查找 Zone，并返回当前 Cloudflare Nameserver。",
-        configured: Boolean((await configuredValue(env, "CLOUDFLARE_ACCOUNT_ID")) && (await configuredValue(env, "CLOUDFLARE_API_TOKEN"))),
+        configured: Boolean(secret(env, "CLOUDFLARE_ACCOUNT_ID") && secret(env, "CLOUDFLARE_API_TOKEN")),
       },
       {
         id: "dynadot",
         name: "Dynadot",
         role: "注册商 Nameserver 写入",
         automation: "已支持：domain_info 检查归属，set_ns 写入 Cloudflare Nameserver。",
-        configured: Boolean(await configuredValue(env, "DYNADOT_API_KEY")),
+        configured: Boolean(secret(env, "DYNADOT_API_KEY")),
         sandbox: dynadotSandbox,
       },
       {
@@ -331,13 +337,19 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/auth/login") {
     assertMethod(request, "POST");
     const body = await readJson<LoginBody>(request);
-    if (!body.password) {
+    if (typeof body.password !== "string" || !body.password) {
       throw new HttpError(400, "bad_request", "请输入后台密码。");
     }
+    if (body.password.length > 256) {
+      throw new HttpError(400, "bad_request", "后台密码不能超过 256 位。");
+    }
+    await assertLoginAllowed(request, env);
     const valid = await verifyPassword(env, body.password);
     if (!valid) {
+      await recordLoginFailure(request, env);
       throw new HttpError(401, "unauthorized", "密码不正确。");
     }
+    await clearLoginFailures(request, env);
     return ok(
       { authenticated: true },
       {
@@ -346,6 +358,24 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
         },
       },
     );
+  }
+
+  if (pathname === "/api/me") {
+    try {
+      await requireSession(request, env);
+      return ok({ authenticated: true });
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 401) {
+        return ok({ authenticated: false });
+      }
+      throw error;
+    }
+  }
+
+  await requireSession(request, env);
+  const origin = request.headers.get("origin");
+  if (request.method !== "GET" && request.method !== "HEAD" && origin && origin !== url.origin) {
+    throw new HttpError(403, "forbidden", "请求来源无效。");
   }
 
   if (pathname === "/api/auth/logout") {
@@ -360,17 +390,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     );
   }
 
-  if (pathname === "/api/me") {
-    try {
-      await requireSession(request, env);
-      return ok({ authenticated: true });
-    } catch {
-      return ok({ authenticated: false });
-    }
-  }
-
-  await requireSession(request, env);
-
   if (pathname === "/api/auth/password") {
     assertMethod(request, "POST");
     const body = await readJson<ChangePasswordBody>(request);
@@ -380,11 +399,18 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (body.newPassword.length < 10) {
       throw new HttpError(400, "bad_request", "新密码至少需要 10 位。");
     }
+    if (body.newPassword.length > 256) {
+      throw new HttpError(400, "bad_request", "新密码不能超过 256 位。");
+    }
     const valid = await verifyPassword(env, body.currentPassword);
     if (!valid) {
       throw new HttpError(401, "unauthorized", "当前密码不正确。");
     }
-    await setSetting(env.DB, "ADMIN_PASSWORD_HASH", await hashPasswordForDocs(body.newPassword));
+    const pepper = secret(env, "PASSWORD_PEPPER");
+    if (!pepper) {
+      throw new HttpError(500, "server_error", "尚未配置 PASSWORD_PEPPER。");
+    }
+    await setSetting(env.DB, "ADMIN_PASSWORD_HASH", await hashPasswordForDocs(body.newPassword, pepper));
     return ok(
       { updated: true },
       {
@@ -402,9 +428,10 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       workerScriptName: env.WORKER_SCRIPT_NAME || "link-shortener-manager",
       hasAdminPasswordHash: await hasConfiguredValue(env, "ADMIN_PASSWORD_HASH"),
       hasSessionSecret: Boolean(secret(env, "SESSION_SECRET")),
-      hasCloudflareAccountId: await hasConfiguredValue(env, "CLOUDFLARE_ACCOUNT_ID"),
-      hasCloudflareApiToken: await hasConfiguredValue(env, "CLOUDFLARE_API_TOKEN"),
-      hasDynadotApiKey: await hasConfiguredValue(env, "DYNADOT_API_KEY"),
+      hasPasswordPepper: Boolean(secret(env, "PASSWORD_PEPPER")),
+      hasCloudflareAccountId: Boolean(secret(env, "CLOUDFLARE_ACCOUNT_ID")),
+      hasCloudflareApiToken: Boolean(secret(env, "CLOUDFLARE_API_TOKEN")),
+      hasDynadotApiKey: Boolean(secret(env, "DYNADOT_API_KEY")),
       dynadotSandbox: String(await configuredValue(env, "DYNADOT_SANDBOX")) === "true",
       visitEventRetentionDays: Number(env.VISIT_EVENT_RETENTION_DAYS || "30"),
     });
@@ -415,20 +442,11 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       return ok(await registrarStatus(env));
     }
     if (request.method === "POST") {
-      const body = await readJson<UpdateRegistrarSettingsBody>(request);
+      const body = await readJson<UpdateRegistrarSettingsBody & Record<string, unknown>>(request);
+      if (["cloudflareAccountId", "cloudflareApiToken", "dynadotApiKey"].some((key) => Object.hasOwn(body, key))) {
+        throw new HttpError(400, "bad_request", "API 凭据只能通过 Wrangler Secret 配置。");
+      }
       const updates: string[] = [];
-      if (body.cloudflareAccountId?.trim()) {
-        await setSetting(env.DB, "CLOUDFLARE_ACCOUNT_ID", body.cloudflareAccountId.trim());
-        updates.push("CLOUDFLARE_ACCOUNT_ID");
-      }
-      if (body.cloudflareApiToken?.trim()) {
-        await setSetting(env.DB, "CLOUDFLARE_API_TOKEN", body.cloudflareApiToken.trim());
-        updates.push("CLOUDFLARE_API_TOKEN");
-      }
-      if (body.dynadotApiKey?.trim()) {
-        await setSetting(env.DB, "DYNADOT_API_KEY", body.dynadotApiKey.trim());
-        updates.push("DYNADOT_API_KEY");
-      }
       if (typeof body.dynadotSandbox === "boolean") {
         await setSetting(env.DB, "DYNADOT_SANDBOX", body.dynadotSandbox ? "true" : "false");
         updates.push("DYNADOT_SANDBOX");

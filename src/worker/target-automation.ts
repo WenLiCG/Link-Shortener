@@ -1,7 +1,7 @@
 import { ensureWorkerDnsRecordForHost, ensureWorkerRouteForHost, findBestZoneForHost, ensureZone, getZone } from "./cloudflare";
 import { getTargetById, updateTargetAutomation, withOperationLock } from "./db";
 import { isDomainInDynadot, setNameservers } from "./dynadot";
-import { configuredValue } from "./env-utils";
+import { secret } from "./env-utils";
 import { refreshTargetHealth } from "./target-health";
 
 function isApexOfZone(host: string, zoneName: string): boolean {
@@ -50,7 +50,7 @@ async function repairTargetServiceUnlocked(env: Env, targetId: string): Promise<
           dynadotStatus: "updated",
         });
       } else {
-        const hasDynadotKey = Boolean(await configuredValue(env, "DYNADOT_API_KEY"));
+        const hasDynadotKey = Boolean(secret(env, "DYNADOT_API_KEY"));
         await updateTargetAutomation(env.DB, target.id, {
           nameserverStatus: hasDynadotKey ? "manual_required" : "skipped_missing_key",
           dynadotStatus: hasDynadotKey ? "not_found" : "skipped_missing_key",

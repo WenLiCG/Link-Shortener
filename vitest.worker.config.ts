@@ -14,6 +14,7 @@ export default defineConfig({
           TEST_MIGRATIONS: await readD1Migrations(path.join(root, "migrations")),
           ADMIN_HOST: "admin.example.com",
           SESSION_SECRET: "test-session-secret",
+          PASSWORD_PEPPER: "test-password-pepper",
           VISITOR_HASH_SECRET: "test-visitor-secret",
           VERIFICATION_SIGNING_SECRET: "test-verification-secret",
           TURNSTILE_SITE_KEY: "1x00000000000000000000BB",

@@ -155,6 +155,7 @@ interface SettingsCheck {
   workerScriptName: string;
   hasAdminPasswordHash: boolean;
   hasSessionSecret: boolean;
+  hasPasswordPepper: boolean;
   hasCloudflareAccountId: boolean;
   hasCloudflareApiToken: boolean;
   hasDynadotApiKey: boolean;
@@ -802,6 +803,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
 
 function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [authError, setAuthError] = useState("");
   const [view, setView] = useState<View>("domains");
   const [selectedDomainId, setSelectedDomainId] = useState<string | null>(null);
   const [domains, setDomains] = useState<RedirectDomain[]>([]);
@@ -850,7 +852,7 @@ function App() {
   useEffect(() => {
     api<{ authenticated: boolean }>("/api/me")
       .then((data) => setAuthenticated(data.authenticated))
-      .catch(() => setAuthenticated(false));
+      .catch((err) => setAuthError(err instanceof Error ? err.message : "后台状态检查失败。"));
   }, []);
 
   useEffect(() => {
@@ -860,7 +862,17 @@ function App() {
   }, [authenticated, filters.groupId, filters.status, filters.days]);
 
   if (authenticated === null) {
-    return <div className="boot">加载中...</div>;
+    return (
+      <div className="boot">
+        {authError ? (
+          <div className="login-panel">
+            <h1>后台暂时无法访问</h1>
+            <p>{authError}</p>
+            <button className="primary" onClick={() => window.location.reload()}>重新加载</button>
+          </div>
+        ) : "加载中..."}
+      </div>
+    );
   }
   if (!authenticated) {
     return <Login onLogin={() => setAuthenticated(true)} />;
@@ -2195,7 +2207,7 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
         </div>
         <div className="alert warn"><AlertTriangle size={16} />批量处理超过 10 个域名容易触发限制，建议分批执行。</div>
         {registrarId === "dynadot" && dynadot && !dynadot.configured && (
-          <div className="alert bad"><AlertTriangle size={16} />Dynadot API Key 尚未配置，请先到“注册商服务”填写。</div>
+          <div className="alert bad"><AlertTriangle size={16} />Dynadot API Key 尚未配置，请先通过 Wrangler Secret 设置。</div>
         )}
         <button className="primary" disabled={loading}>
           {loading ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
@@ -2501,9 +2513,6 @@ function CloudflareZoneDeleteView() {
 }
 
 function RegistrarsView({ registrars, onUpdated }: { registrars: RegistrarStatus | null; onUpdated: () => Promise<void> }) {
-  const [cloudflareAccountId, setCloudflareAccountId] = useState("");
-  const [cloudflareApiToken, setCloudflareApiToken] = useState("");
-  const [dynadotApiKey, setDynadotApiKey] = useState("");
   const [dynadotSandbox, setDynadotSandbox] = useState(false);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
@@ -2520,14 +2529,7 @@ function RegistrarsView({ registrars, onUpdated }: { registrars: RegistrarStatus
     setSaving(true);
     setMessage("");
     try {
-      const body: Record<string, string | boolean> = { dynadotSandbox };
-      if (cloudflareAccountId.trim()) body.cloudflareAccountId = cloudflareAccountId.trim();
-      if (cloudflareApiToken.trim()) body.cloudflareApiToken = cloudflareApiToken.trim();
-      if (dynadotApiKey.trim()) body.dynadotApiKey = dynadotApiKey.trim();
-      await api("/api/registrars", { method: "POST", body: JSON.stringify(body) });
-      setCloudflareAccountId("");
-      setCloudflareApiToken("");
-      setDynadotApiKey("");
+      await api("/api/registrars", { method: "POST", body: JSON.stringify({ dynadotSandbox }) });
       setMessage("配置已保存。");
       await onUpdated();
     } catch (err) {
@@ -2554,19 +2556,13 @@ function RegistrarsView({ registrars, onUpdated }: { registrars: RegistrarStatus
       </div>
 
       <form className="panel" onSubmit={submit}>
-        <h2>API Key 设置</h2>
-        <label>
-          Cloudflare Account ID
-          <input value={cloudflareAccountId} onChange={(event) => setCloudflareAccountId(event.target.value)} placeholder="留空则不修改" />
-        </label>
-        <label>
-          Cloudflare API Token
-          <input type="password" value={cloudflareApiToken} onChange={(event) => setCloudflareApiToken(event.target.value)} placeholder="留空则不修改" />
-        </label>
-        <label>
-          Dynadot API Key
-          <input type="password" value={dynadotApiKey} onChange={(event) => setDynadotApiKey(event.target.value)} placeholder="留空则不修改" />
-        </label>
+        <h2>凭据配置</h2>
+        <div className="note">
+          API 凭据仅保存在 Cloudflare Worker Secrets，不会写入 D1。
+          <code>npx wrangler secret put CLOUDFLARE_ACCOUNT_ID</code>
+          <code>npx wrangler secret put CLOUDFLARE_API_TOKEN</code>
+          <code>npx wrangler secret put DYNADOT_API_KEY</code>
+        </div>
         <label className="switch">
           <input type="checkbox" checked={dynadotSandbox} onChange={(event) => setDynadotSandbox(event.target.checked)} />
           <span>使用 Dynadot Sandbox</span>
@@ -2574,7 +2570,7 @@ function RegistrarsView({ registrars, onUpdated }: { registrars: RegistrarStatus
         </label>
         <button className="primary" disabled={saving}>
           {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-          保存配置
+          保存 Sandbox 设置
         </button>
         {message && <div className="note">{message}</div>}
       </form>
@@ -2595,6 +2591,7 @@ function SettingsView({ settings, onUpdated, onLogout }: { settings: SettingsChe
       ["后台 Host", Boolean(settings.adminHost), settings.adminHost ?? "未配置"],
       ["后台密码 Hash", settings.hasAdminPasswordHash, "ADMIN_PASSWORD_HASH"],
       ["Session Secret", settings.hasSessionSecret, "SESSION_SECRET"],
+      ["Password Pepper", settings.hasPasswordPepper, "PASSWORD_PEPPER"],
       ["Cloudflare Account", settings.hasCloudflareAccountId, "CLOUDFLARE_ACCOUNT_ID"],
       ["Cloudflare Token", settings.hasCloudflareApiToken, "CLOUDFLARE_API_TOKEN"],
       ["Dynadot API Key", settings.hasDynadotApiKey, settings.dynadotSandbox ? "Sandbox" : "Production"],

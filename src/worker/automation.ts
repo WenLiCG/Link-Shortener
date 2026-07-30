@@ -9,7 +9,7 @@ import {
   withOperationLock,
 } from "./db";
 import { isDomainInDynadot, setNameservers } from "./dynadot";
-import { configuredValue } from "./env-utils";
+import { secret } from "./env-utils";
 import { isValidDomain } from "./shared";
 import { refreshStaleTargetHealth } from "./target-health";
 
@@ -65,7 +65,7 @@ async function processDomainJobUnlocked(env: Env, redirectDomainId: string, jobI
       }
       const ownedByDynadot = await isDomainInDynadot(env, domain.domain);
       if (!ownedByDynadot) {
-        const hasDynadotKey = Boolean(await configuredValue(env, "DYNADOT_API_KEY"));
+        const hasDynadotKey = Boolean(secret(env, "DYNADOT_API_KEY"));
         await updateDomainAutomation(env.DB, domain.id, {
           dynadotStatus: hasDynadotKey ? "not_found" : "skipped_missing_key",
           nameserverStatus: "manual_required",

@@ -1,11 +1,12 @@
 export type SecretName =
   | "ADMIN_PASSWORD_HASH"
   | "SESSION_SECRET"
+  | "PASSWORD_PEPPER"
   | "CLOUDFLARE_ACCOUNT_ID"
   | "CLOUDFLARE_API_TOKEN"
   | "DYNADOT_API_KEY";
 
-export type ConfigName = SecretName | "DYNADOT_SANDBOX";
+export type ConfigName = "ADMIN_PASSWORD_HASH" | "DYNADOT_SANDBOX";
 
 export function secret(env: Env, name: SecretName): string | undefined {
   const value = Reflect.get(env, name) as unknown;

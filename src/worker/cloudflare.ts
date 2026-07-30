@@ -1,3 +1,6 @@
+import { secret } from "./env-utils";
+import { ProviderError } from "./provider-error";
+
 export interface CloudflareZone {
   id: string;
   name: string;
@@ -14,12 +17,13 @@ interface CloudflareApiResponse<T> {
   success: boolean;
   result: T;
   errors?: Array<{ code: number; message: string }>;
+  result_info?: { page?: number; total_pages?: number };
 }
 
-async function cfHeaders(env: Env): Promise<HeadersInit> {
+function cfHeaders(env: Env): HeadersInit {
   const token = secret(env, "CLOUDFLARE_API_TOKEN");
   if (!token) {
-    throw new Error("缺少 CLOUDFLARE_API_TOKEN。");
+    throw new ProviderError("cloudflare", null, "missing_token", false, "尚未配置 Cloudflare API Token。");
   }
   return {
     authorization: `Bearer ${token}`,
@@ -27,22 +31,65 @@ async function cfHeaders(env: Env): Promise<HeadersInit> {
   };
 }
 
-function errorMessage(errors?: Array<{ message: string }>): string {
-  return errors?.map((error) => error.message).join("; ") || "Cloudflare API 请求失败。";
+async function cfResponse<T>(env: Env, path: string, init?: RequestInit): Promise<CloudflareApiResponse<T>> {
+  let response: Response;
+  try {
+    response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(10_000),
+      headers: {
+        ...cfHeaders(env),
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof ProviderError) {
+      throw error;
+    }
+    const timeout = error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError");
+    throw new ProviderError(
+      "cloudflare",
+      null,
+      timeout ? "timeout" : "network_error",
+      true,
+      timeout ? "Cloudflare 请求超时。" : "无法连接 Cloudflare。",
+    );
+  }
+  if (!response.ok) {
+    const retryable = response.status === 429 || response.status >= 500;
+    throw new ProviderError(
+      "cloudflare",
+      response.status,
+      `http_${response.status}`,
+      retryable,
+      retryable ? "Cloudflare 暂时不可用，请稍后重试。" : "Cloudflare 拒绝了请求，请检查配置。",
+    );
+  }
+  let body: CloudflareApiResponse<T>;
+  try {
+    const parsed = await response.json();
+    if (!parsed || typeof parsed !== "object" || !("success" in parsed) || !("result" in parsed)) {
+      throw new Error("invalid_response");
+    }
+    body = parsed as CloudflareApiResponse<T>;
+  } catch {
+    throw new ProviderError("cloudflare", response.status, "invalid_response", true, "Cloudflare 返回了无效响应。");
+  }
+  if (!body.success) {
+    const code = body.errors?.[0]?.code;
+    throw new ProviderError(
+      "cloudflare",
+      response.status,
+      code === undefined ? "api_error" : `api_${code}`,
+      false,
+      "Cloudflare 拒绝了请求，请检查配置。",
+    );
+  }
+  return body;
 }
 
 async function cfRequest<T>(env: Env, path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
-    ...init,
-    headers: {
-      ...(await cfHeaders(env)),
-      ...(init?.headers ?? {}),
-    },
-  });
-  const body = (await response.json()) as CloudflareApiResponse<T>;
-  if (!response.ok || !body.success) {
-    throw new Error(errorMessage(body.errors));
-  }
+  const body = await cfResponse<T>(env, path, init);
   return body.result;
 }
 
@@ -73,12 +120,14 @@ function mapZoneListItem(zone: {
 export async function listZones(env: Env): Promise<CloudflareZoneListItem[]> {
   const zones: CloudflareZoneListItem[] = [];
   const perPage = 50;
-  for (let page = 1; page <= 10; page += 1) {
-    const items = await cfRequest<
+  for (let page = 1; ; page += 1) {
+    const body = await cfResponse<
       Array<{ id: string; name: string; status: string; name_servers?: string[]; created_on?: string; modified_on?: string }>
     >(env, `/zones?per_page=${perPage}&page=${page}&order=name&direction=asc`);
+    const items = body.result;
     zones.push(...items.map(mapZoneListItem));
-    if (items.length < perPage) {
+    const totalPages = body.result_info?.total_pages;
+    if (items.length === 0 || (totalPages !== undefined ? page >= totalPages : items.length < perPage)) {
       break;
     }
   }
@@ -95,7 +144,7 @@ export async function ensureZone(env: Env, domain: string): Promise<CloudflareZo
   }
   const accountId = secret(env, "CLOUDFLARE_ACCOUNT_ID");
   if (!accountId) {
-    throw new Error("缺少 CLOUDFLARE_ACCOUNT_ID。");
+    throw new ProviderError("cloudflare", null, "missing_account_id", false, "尚未配置 Cloudflare Account ID。");
   }
   const created = await cfRequest<{ id: string; name: string; status: string; name_servers?: string[] }>(env, "/zones", {
     method: "POST",
@@ -162,26 +211,19 @@ async function replaceWithWorkerDnsRecord(env: Env, zoneId: string, host: string
     await createWorkerDnsRecord(env, zoneId, host);
     return;
   }
-  try {
-    await cfRequest(env, `/zones/${zoneId}/dns_records/${records[0].id}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        type: "A",
-        name: host,
-        content: "192.0.2.1",
-        ttl: 1,
-        proxied: true,
-        comment: "Managed by Link Shortener Manager target service",
-      }),
-    });
-    for (const record of records.slice(1)) {
-      await cfRequest(env, `/zones/${zoneId}/dns_records/${record.id}`, { method: "DELETE" });
-    }
-  } catch {
-    for (const record of records) {
-      await cfRequest(env, `/zones/${zoneId}/dns_records/${record.id}`, { method: "DELETE" });
-    }
-    await createWorkerDnsRecord(env, zoneId, host);
+  await cfRequest(env, `/zones/${zoneId}/dns_records/${records[0].id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      type: "A",
+      name: host,
+      content: "192.0.2.1",
+      ttl: 1,
+      proxied: true,
+      comment: "Managed by Link Shortener Manager target service",
+    }),
+  });
+  for (const record of records.slice(1)) {
+    await cfRequest(env, `/zones/${zoneId}/dns_records/${record.id}`, { method: "DELETE" });
   }
 }
 
@@ -189,7 +231,9 @@ export async function ensureWorkerDnsRecordForHost(env: Env, zoneId: string, hos
   const records = await findAddressRecordsForHost(env, zoneId, host);
   const alreadyConfigured = records.some((record) => record.type === "A" && record.content === "192.0.2.1" && record.proxied);
   if (alreadyConfigured) {
-    for (const record of records.filter((item) => item.type !== "A" || item.content !== "192.0.2.1")) {
+    for (const record of records.filter(
+      (item) => item.type !== "A" || item.content !== "192.0.2.1" || !item.proxied,
+    )) {
       await cfRequest(env, `/zones/${zoneId}/dns_records/${record.id}`, { method: "DELETE" });
     }
     return;
@@ -198,53 +242,52 @@ export async function ensureWorkerDnsRecordForHost(env: Env, zoneId: string, hos
 }
 
 export async function ensureDnsRecords(env: Env, zoneId: string, domain: string): Promise<void> {
-  for (const name of [domain, `*.${domain}`]) {
-    const existing = await cfRequest<Array<{ id: string }>>(
-      env,
-      `/zones/${zoneId}/dns_records?type=A&name=${encodeURIComponent(name)}&per_page=1`,
-    );
-    if (existing.length > 0) {
-      continue;
-    }
-    await cfRequest(env, `/zones/${zoneId}/dns_records`, {
+  await ensureWorkerDnsRecordForHost(env, zoneId, domain);
+  await ensureWorkerDnsRecordForHost(env, zoneId, `*.${domain}`);
+}
+
+interface WorkerRoute {
+  id: string;
+  pattern: string;
+  script?: string | null;
+}
+
+async function ensureWorkerRoute(
+  env: Env,
+  zoneId: string,
+  routes: WorkerRoute[],
+  pattern: string,
+  script: string,
+): Promise<void> {
+  const existing = routes.find((route) => route.pattern === pattern);
+  if (!existing) {
+    await cfRequest(env, `/zones/${zoneId}/workers/routes`, {
       method: "POST",
-      body: JSON.stringify({
-        type: "A",
-        name,
-        content: "192.0.2.1",
-        ttl: 1,
-        proxied: true,
-        comment: "Managed by Link Shortener Manager",
-      }),
+      body: JSON.stringify({ pattern, script }),
+    });
+    return;
+  }
+  if (existing.script !== script) {
+    await cfRequest(env, `/zones/${zoneId}/workers/routes/${existing.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ pattern, script }),
     });
   }
 }
 
 export async function ensureWorkerRoutes(env: Env, zoneId: string, domain: string): Promise<void> {
   const script = env.WORKER_SCRIPT_NAME || "link-shortener-manager";
-  const existingRoutes = await cfRequest<Array<{ id: string; pattern: string }>>(env, `/zones/${zoneId}/workers/routes`);
+  const routes = await cfRequest<WorkerRoute[]>(env, `/zones/${zoneId}/workers/routes`);
   for (const pattern of [`${domain}/*`, `*.${domain}/*`]) {
-    if (existingRoutes.some((route) => route.pattern === pattern)) {
-      continue;
-    }
-    await cfRequest(env, `/zones/${zoneId}/workers/routes`, {
-      method: "POST",
-      body: JSON.stringify({ pattern, script }),
-    });
+    await ensureWorkerRoute(env, zoneId, routes, pattern, script);
   }
 }
 
 export async function ensureWorkerRouteForHost(env: Env, zoneId: string, host: string): Promise<void> {
   const script = env.WORKER_SCRIPT_NAME || "link-shortener-manager";
   const pattern = `${host}/*`;
-  const existingRoutes = await cfRequest<Array<{ id: string; pattern: string }>>(env, `/zones/${zoneId}/workers/routes`);
-  if (existingRoutes.some((route) => route.pattern === pattern)) {
-    return;
-  }
-  await cfRequest(env, `/zones/${zoneId}/workers/routes`, {
-    method: "POST",
-    body: JSON.stringify({ pattern, script }),
-  });
+  const routes = await cfRequest<WorkerRoute[]>(env, `/zones/${zoneId}/workers/routes`);
+  await ensureWorkerRoute(env, zoneId, routes, pattern, script);
 }
 
 export async function getZone(env: Env, zoneId: string): Promise<CloudflareZone> {
@@ -264,4 +307,3 @@ export async function deleteZoneByName(env: Env, domain: string): Promise<{ dele
   await cfRequest(env, `/zones/${zone.id}`, { method: "DELETE" });
   return { deleted: true, zoneId: zone.id, status: "deleted", message: "已删除 Cloudflare Zone。" };
 }
-import { secret } from "./env-utils";

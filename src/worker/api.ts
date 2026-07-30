@@ -38,6 +38,7 @@ import {
 import { isDomainInDynadot, setNameservers } from "./dynadot";
 import { HttpError, fail, ok, readJson } from "./http";
 import { configuredValue, hasConfiguredValue, secret } from "./env-utils";
+import { ProviderError } from "./provider-error";
 import { type RedirectMode, isValidDomain, normalizeDomain } from "./shared";
 import { repairTargetService } from "./target-automation";
 import { refreshTargetHealth } from "./target-health";
@@ -279,7 +280,7 @@ async function runNameserverToolUnlocked(env: Env, input: NameserverToolBody) {
         domain,
         ok: false,
         status: "failed",
-        message: error instanceof Error ? error.message : "处理失败。",
+        message: error instanceof ProviderError ? error.message : "处理失败。",
         nameservers: [],
       });
     }
@@ -323,7 +324,7 @@ async function deleteCloudflareZonesUnlocked(env: Env, input: DeleteCloudflareZo
         domain,
         ok: false,
         status: "failed",
-        message: error instanceof Error ? error.message : "删除失败。",
+        message: error instanceof ProviderError ? error.message : "删除失败。",
       });
     }
   }
@@ -746,8 +747,17 @@ export function apiError(error: unknown): Response {
   if (error instanceof HttpError) {
     return fail(error.status, error.code, error.message);
   }
-  const message = error instanceof Error ? error.message : "服务器内部错误。";
-  console.error(JSON.stringify({ event: "api_error", message }));
-  const sanitized = message.includes("TOKEN") || message.includes("KEY") ? "服务器配置错误。" : message;
-  return fail(500, "server_error", sanitized);
+  const requestId = crypto.randomUUID();
+  if (error instanceof ProviderError) {
+    console.error(JSON.stringify({
+      event: "provider_error",
+      requestId,
+      provider: error.provider,
+      status: error.status,
+      code: error.code,
+    }));
+    return fail(error.retryable ? 503 : 502, "server_error", error.message);
+  }
+  console.error(JSON.stringify({ event: "api_error", requestId }));
+  return fail(500, "server_error", "服务器内部错误。");
 }

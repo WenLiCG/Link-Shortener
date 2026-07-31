@@ -19,6 +19,14 @@ Before a remote migration, export D1 to a local backup outside the repository. T
 
 Turnstile remains disabled. A real non-production browser gate must validate the entry-host/relay-host transport, strict Siteverify hostname and action binding, third-party-cookie blocking, script blocking, timeout fail-open behavior, and Referer behavior before it can record verified visitors.
 
+## Deployment record
+
+- Date: 2026-07-31
+- D1 backup: completed before migration, outside the repository.
+- Applied migrations: `0017_remove_stored_credentials.sql`, `0018_domain_jobs_queue.sql`, `0019_daily_visitor_facts.sql`.
+- Worker version: `21cc389d-43f8-4f5d-b7bc-5efb3f38a899`.
+- Smoke checks: `https://link.g60.net/` returned 200; unauthenticated `GET /api/me` returned `{ authenticated: false }`.
+
 ## Rollback
 
 Roll back by deploying the prior Worker version. The migrations are additive; do not attempt a destructive D1 schema downgrade during an incident.

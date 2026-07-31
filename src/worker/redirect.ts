@@ -139,27 +139,27 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
       : buildTargetUrl(domain.targetHost);
   if (shouldRecordPageView(request)) {
     ctx.waitUntil(
-      recordVisit(env.DB, {
-        redirectDomainId: domain.id,
-        host,
-        path: url.pathname,
-        referer: request.headers.get("referer"),
-        country: request.cf?.country ? String(request.cf.country) : null,
-        region: request.cf?.region ? String(request.cf.region) : null,
-        city: request.cf?.city ? String(request.cf.city) : null,
-        timezone: request.cf?.timezone ? String(request.cf.timezone) : null,
-        latitude: numberFromCf(request.cf?.latitude),
-        longitude: numberFromCf(request.cf?.longitude),
-        language: firstLanguage(request.headers.get("accept-language")),
-        operatingSystem: client.operatingSystem,
-        browser: client.browser,
-        deviceType: client.deviceType,
-        userAgent,
-        targetHost: domain.redirectMode === "direct" ? domain.directTargetHost ?? domain.targetHost : domain.targetHost,
-        hideReferer: domain.hideReferer,
-        visitorKey: await visitorKeyFromRequest(request, env, host),
-        isBot: isLikelyBotRequest(request),
-      }),
+      (async () => recordVisit(env.DB, {
+          redirectDomainId: domain.id,
+          host,
+          path: url.pathname,
+          referer: request.headers.get("referer"),
+          country: request.cf?.country ? String(request.cf.country) : null,
+          region: request.cf?.region ? String(request.cf.region) : null,
+          city: request.cf?.city ? String(request.cf.city) : null,
+          timezone: request.cf?.timezone ? String(request.cf.timezone) : null,
+          latitude: numberFromCf(request.cf?.latitude),
+          longitude: numberFromCf(request.cf?.longitude),
+          language: firstLanguage(request.headers.get("accept-language")),
+          operatingSystem: client.operatingSystem,
+          browser: client.browser,
+          deviceType: client.deviceType,
+          userAgent,
+          targetHost: domain.redirectMode === "direct" ? domain.directTargetHost ?? domain.targetHost : domain.targetHost,
+          hideReferer: domain.hideReferer,
+          visitorKey: await visitorKeyFromRequest(request, env, host),
+          isBot: isLikelyBotRequest(request),
+        }))(),
     );
   }
   if (domain.hideReferer) {

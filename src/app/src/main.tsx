@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -27,6 +27,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { runSerialBatch } from "./batch";
+import { useOperationPolling } from "./hooks/useOperationPolling";
 import "./styles.css";
 
 type ApiBody<T> = { ok: true; data: T } | { ok: false; error: { code: string; message: string } };
@@ -183,6 +185,8 @@ interface NameserverToolResult {
   message: string;
   nameservers: string[];
   zoneStatus?: string;
+  jobId?: string;
+  requestKey?: string;
 }
 
 interface CloudflareDeleteResult {
@@ -191,6 +195,8 @@ interface CloudflareDeleteResult {
   status: string;
   message: string;
   zoneId?: string;
+  jobId?: string;
+  requestKey?: string;
 }
 
 interface CloudflareZoneItem {
@@ -223,17 +229,28 @@ interface CreateDomainPayload {
   hideReferer: boolean;
 }
 
+interface OperationJob {
+  id: string;
+  subjectId: string;
+  status: "queued" | "running" | "retry_wait" | "completed" | "failed";
+  currentStep: string;
+  errorMessage: string | null;
+  payload: Record<string, unknown>;
+}
+
 const ADD_RESULTS_STORAGE_KEY = "link-shortener-add-results-v1";
+const NAMESERVER_RESULTS_STORAGE_KEY = "link-shortener-nameserver-results-v1";
+const ZONE_DELETE_RESULTS_STORAGE_KEY = "link-shortener-zone-delete-results-v1";
 const REQUEST_TIMEOUT_MS = 45_000;
 const DOMAIN_PROCESS_TIMEOUT_MS = 120_000;
 const DOMAIN_POLL_INTERVAL_MS = 3_000;
 
-function loadStoredAddResults(): CreateDomainResult[] | null {
+function loadStoredResults<T>(key: string): T[] | null {
   try {
-    const raw = window.localStorage.getItem(ADD_RESULTS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : null;
+    return Array.isArray(parsed) ? parsed as T[] : null;
   } catch {
     return null;
   }
@@ -251,16 +268,19 @@ function sleep(ms: number): Promise<void> {
 }
 
 function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
+  return error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
-async function api<T>(path: string, init?: RequestInit, options: { timeoutMs?: number } = {}): Promise<T> {
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), options.timeoutMs ?? REQUEST_TIMEOUT_MS);
+async function api<T>(
+  path: string,
+  init?: RequestInit,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<T> {
+  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(path, {
       ...init,
-      signal: controller.signal,
+      signal: options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal,
       headers: {
         "content-type": "application/json",
         ...(init?.headers ?? {}),
@@ -276,9 +296,27 @@ async function api<T>(path: string, init?: RequestInit, options: { timeoutMs?: n
       throw new Error("请求超时，已继续处理下一项。");
     }
     throw error;
-  } finally {
-    window.clearTimeout(timeoutId);
   }
+}
+
+function operationResult<T>(job: OperationJob): Partial<T> {
+  const result = job.payload.result;
+  return result && typeof result === "object" && !Array.isArray(result) ? result as Partial<T> : {};
+}
+
+async function waitForOperation(jobId: string): Promise<OperationJob> {
+  const deadline = Date.now() + DOMAIN_PROCESS_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const job = await api<OperationJob>(`/api/jobs/${jobId}`, undefined, { timeoutMs: 15_000 });
+    if (job.status === "completed") {
+      return job;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.errorMessage ?? "处理失败，请手动重新执行。");
+    }
+    await sleep(DOMAIN_POLL_INTERVAL_MS);
+  }
+  throw new Error("处理超时，后台任务仍会继续；可点击右侧按钮查询或重新执行。");
 }
 
 function formatDate(value: string | null): string {
@@ -304,6 +342,8 @@ function statusText(status: string): string {
     active: "可用",
     failed: "失败",
     queued: "已创建任务",
+    running: "处理中",
+    retry_wait: "等待重试",
     pending: "待处理",
     configured: "已配置",
     submitted: "已提交",
@@ -316,34 +356,6 @@ function statusText(status: string): string {
     ok: "OK",
   };
   return map[status] ?? status;
-}
-
-async function waitForDomainCompletion(id: string): Promise<Pick<CreateDomainResult, "status" | "error">> {
-  const deadline = Date.now() + DOMAIN_PROCESS_TIMEOUT_MS;
-  let lastStatus = "queued";
-  let lastError: string | undefined;
-
-  while (Date.now() < deadline) {
-    await sleep(DOMAIN_POLL_INTERVAL_MS);
-    try {
-      const detail = await api<DomainDetail>(`/api/domains/${id}`, undefined, { timeoutMs: 15_000 });
-      lastStatus = detail.status;
-      lastError = detail.lastError ?? undefined;
-      if (detail.status === "active") {
-        return { status: "active", error: undefined };
-      }
-      if (detail.status === "failed") {
-        return { status: "failed", error: detail.lastError ?? "处理失败，请手动重新执行。" };
-      }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : "查询状态失败。";
-    }
-  }
-
-  return {
-    status: "failed",
-    error: `处理超时，最后状态：${statusText(lastStatus)}。可点击右侧按钮手动重新执行。${lastError ? ` ${lastError}` : ""}`,
-  };
 }
 
 function statusClass(status: string): string {
@@ -383,7 +395,7 @@ function EmptyState({ title, text }: { title: string; text: string }) {
 type ResultSummaryItem = { ok: boolean; status?: string | null };
 
 function isProcessingStatus(status?: string | null): boolean {
-  return !status || ["queued", "running", "pending", "checking", "validating", "cloudflare_zone", "nameserver_update", "dns_configured", "route_configured", "waiting_nameserver"].includes(status);
+  return !status || ["queued", "running", "retry_wait", "pending", "checking", "validating", "cloudflare_zone", "nameserver_update", "dns_configured", "route_configured", "waiting_nameserver"].includes(status);
 }
 
 function ResultSummary({ items, total }: { items: ResultSummaryItem[] | null; total?: number }) {
@@ -1015,13 +1027,23 @@ function DomainsView({
     setMessage("");
     try {
       const failures: string[] = [];
-      for (const id of selected) {
-        try {
-          await api("/api/domains", { method: "DELETE", body: JSON.stringify({ ids: [id] }) });
-        } catch (error) {
-          failures.push(error instanceof Error ? error.message : id);
-        }
-      }
+      await runSerialBatch(
+        selected,
+        async (id) => {
+          const queued = await api<{ jobId: string }>("/api/domains", {
+            method: "DELETE",
+            headers: { "idempotency-key": crypto.randomUUID() },
+            body: JSON.stringify({ ids: [id] }),
+          });
+          await waitForOperation(queued.jobId);
+          return id;
+        },
+        (id, outcome) => {
+          if (!outcome.ok) {
+            failures.push(`${id}: ${outcome.error.message}`);
+          }
+        },
+      );
       setSelected([]);
       await onDeleted();
       if (failures.length > 0) {
@@ -1034,9 +1056,16 @@ function DomainsView({
 
   async function retryDomain(domain: RedirectDomain) {
     setRetryingIds((current) => [...new Set([...current, domain.id])]);
+    setMessage("");
     try {
-      await api(`/api/domains/${domain.id}/retry`, { method: "POST", body: JSON.stringify({}) });
+      const queued = await api<{ jobId: string }>(`/api/domains/${domain.id}/retry`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await waitForOperation(queued.jobId);
       await onDeleted();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "重新配置失败。");
     } finally {
       setRetryingIds((current) => current.filter((id) => id !== domain.id));
     }
@@ -1206,13 +1235,16 @@ function ShortLinksView({
     setMessage("");
     try {
       const failures: string[] = [];
-      for (const id of selected) {
-        try {
-          await api("/api/short-links", { method: "DELETE", body: JSON.stringify({ ids: [id] }) });
-        } catch (error) {
-          failures.push(error instanceof Error ? error.message : id);
-        }
-      }
+      await runSerialBatch(
+        selected,
+        (id) => api("/api/short-links", { method: "DELETE", body: JSON.stringify({ ids: [id] }) }),
+        (id, outcome) => {
+          if (!outcome.ok) {
+            failures.push(`${id}: ${outcome.error.message}`);
+          }
+        },
+        REQUEST_TIMEOUT_MS + 1_000,
+      );
       setSelected([]);
       await onUpdated();
       if (failures.length > 0) {
@@ -1353,8 +1385,12 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
   const [groupId, setGroupId] = useState("");
   const [newGroupName, setNewGroupName] = useState("");
   const [hideReferer, setHideReferer] = useState(true);
-  const [result, setResult] = useState<CreateDomainResult[] | null>(() => loadStoredAddResults());
-  const [resultTotal, setResultTotal] = useState(() => loadStoredAddResults()?.length ?? 0);
+  const [result, setResult] = useState<CreateDomainResult[] | null>(
+    () => loadStoredResults<CreateDomainResult>(ADD_RESULTS_STORAGE_KEY),
+  );
+  const [resultTotal, setResultTotal] = useState(
+    () => loadStoredResults<CreateDomainResult>(ADD_RESULTS_STORAGE_KEY)?.length ?? 0,
+  );
   const [loading, setLoading] = useState(false);
   const [retryingIds, setRetryingIds] = useState<string[]>([]);
 
@@ -1366,38 +1402,26 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
     }
   }, [result]);
 
-  useEffect(() => {
-    if (!result?.some((item) => item.ok && item.id && item.status !== "active" && item.status !== "failed")) {
-      return;
-    }
-    let cancelled = false;
-    const refreshResults = async () => {
-      const updates = await Promise.all(
-        result.map(async (item) => {
-          if (!item.ok || !item.id || item.status === "active" || item.status === "failed") {
-            return item;
-          }
-          try {
-            const detail = await api<DomainDetail>(`/api/domains/${item.id}`);
-            return { ...item, status: detail.status, error: detail.lastError ?? item.error };
-          } catch {
-            return item;
-          }
-        }),
-      );
-      if (!cancelled) {
-        setResult(updates);
+  const pendingOperationIds = useMemo(
+    () => loading ? [] : result?.filter((item) => item.jobId && isProcessingStatus(item.status)).map((item) => item.jobId!) ?? [],
+    [loading, result],
+  );
+  const refreshOperation = useCallback(async (jobId: string, signal: AbortSignal) => {
+    const job = await api<OperationJob>(`/api/jobs/${jobId}`, undefined, { timeoutMs: 15_000, signal });
+    setResult((current) => current?.map((item) => {
+      if (item.jobId !== jobId) {
+        return item;
       }
-    };
-    const interval = window.setInterval(() => {
-      void refreshResults();
-    }, 3000);
-    void refreshResults();
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [result]);
+      if (job.status === "completed") {
+        return { ...item, ok: true, status: "active", error: undefined };
+      }
+      if (job.status === "failed") {
+        return { ...item, ok: false, status: "failed", error: job.errorMessage ?? "处理失败，请手动重新执行。" };
+      }
+      return { ...item, status: job.status };
+    }) ?? current);
+  }, []);
+  useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS);
 
   function replaceResult(domain: string, next: CreateDomainResult) {
     setResult((current) => current?.map((item) => (item.domain === domain ? next : item)) ?? current);
@@ -1418,6 +1442,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
 
   async function createOneDomain(payload: CreateDomainPayload): Promise<CreateDomainResult> {
     const domain = payload.domains;
+    let started: CreateDomainResult = { domain, ok: true, status: "queued", retryPayload: payload };
     try {
       const data = await api<{ results: CreateDomainResult[] }>(
         "/api/domains",
@@ -1431,13 +1456,16 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
       if (!item.ok || !item.id) {
         return { ...item, domain: item.domain || domain, status: item.status ?? "failed", retryPayload: payload };
       }
-      const started = { ...item, status: "queued", retryPayload: payload };
+      started = { ...item, status: "queued", retryPayload: payload };
       replaceResult(domain, started);
-      const finalStatus = await waitForDomainCompletion(item.id);
-      return { ...started, ...finalStatus };
+      if (!item.jobId) {
+        throw new Error("服务端没有返回任务 ID。");
+      }
+      await waitForOperation(item.jobId);
+      return { ...started, ok: true, status: "active", error: undefined };
     } catch (error) {
       return {
-        domain,
+        ...started,
         ok: false,
         status: "failed",
         error: error instanceof Error ? error.message : "创建失败。",
@@ -1450,21 +1478,29 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
     event.preventDefault();
     setLoading(true);
     try {
-      const domainItems = splitDomainInput(domains);
+      const domainItems = [...new Set(splitDomainInput(domains))];
       if (domainItems.length === 0) {
         setResult([{ domain: "-", ok: false, error: "请至少输入一个入口域名。" }]);
         return;
       }
-      const nextResults: CreateDomainResult[] = [];
       setResultTotal(domainItems.length);
-      setResult([]);
-      for (const domain of domainItems) {
-        const payload = domainPayload(domain);
-        nextResults.push({ domain, ok: true, status: "queued", retryPayload: payload });
-        setResult([...nextResults]);
-        nextResults[nextResults.length - 1] = await createOneDomain(payload);
-        setResult([...nextResults]);
-      }
+      setResult(domainItems.map((domain) => ({
+        domain,
+        ok: true,
+        status: "pending",
+        retryPayload: domainPayload(domain),
+      })));
+      await runSerialBatch(
+        domainItems,
+        (domain) => createOneDomain(domainPayload(domain)),
+        (domain, outcome) => replaceResult(domain, outcome.ok ? outcome.value : {
+          domain,
+          ok: false,
+          status: "failed",
+          error: outcome.error.message,
+          retryPayload: domainPayload(domain),
+        }),
+      );
       await onCreated();
     } finally {
       setLoading(false);
@@ -1483,8 +1519,14 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
     try {
       let next: CreateDomainResult;
       if (item.id) {
-        await api<{ id: string; jobId: string }>(`/api/domains/${item.id}/retry`, { method: "POST", body: JSON.stringify({}) });
-        next = { ...item, ok: true, ...(await waitForDomainCompletion(item.id)) };
+        const queued = await api<{ jobId: string; status: string }>(`/api/domains/${item.id}/retry`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        next = { ...item, ok: true, jobId: queued.jobId, status: queued.status, error: undefined };
+        replaceResult(item.domain, next);
+        await waitForOperation(queued.jobId);
+        next = { ...next, status: "active" };
       } else {
         next = await createOneDomain(item.retryPayload as CreateDomainPayload);
       }
@@ -1628,133 +1670,6 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
   );
 }
 
-function AddView({ targets, groups, onCreated }: { targets: TargetService[]; groups: DomainGroup[]; onCreated: () => Promise<void> }) {
-  const [domains, setDomains] = useState("");
-  const [redirectMode, setRedirectMode] = useState<RedirectMode>("direct");
-  const [targetServiceId, setTargetServiceId] = useState("");
-  const [directTargetHost, setDirectTargetHost] = useState("");
-  const [targetForwardHost, setTargetForwardHost] = useState("");
-  const [groupId, setGroupId] = useState("");
-  const [newGroupName, setNewGroupName] = useState("");
-  const [hideReferer, setHideReferer] = useState(true);
-  const [result, setResult] = useState<Array<{ domain: string; ok: boolean; error?: string }> | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    setLoading(true);
-    try {
-      const nextResults: Array<{ domain: string; ok: boolean; error?: string }> = [];
-      for (const domain of splitDomainInput(domains)) {
-        try {
-          const data = await api<{ results: Array<{ domain: string; ok: boolean; error?: string }> }>("/api/domains", {
-            method: "POST",
-            body: JSON.stringify({
-              domains: domain,
-              redirectMode,
-              targetServiceId,
-              directTargetHost,
-              targetForwardHost,
-              groupId: groupId || null,
-              newGroupName,
-              hideReferer,
-            }),
-          });
-          nextResults.push(...data.results);
-        } catch (error) {
-          nextResults.push({ domain, ok: false, error: error instanceof Error ? error.message : "创建失败。" });
-        }
-        setResult([...nextResults]);
-      }
-      await onCreated();
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <section className="split">
-      <form className="panel" onSubmit={submit}>
-        <h2>批量新增入口域名</h2>
-        <label>
-          入口域名
-          <textarea placeholder={"abc.com\ntest.com\naaa.net"} value={domains} onChange={(event) => setDomains(event.target.value)} />
-        </label>
-        <div className="mode-tabs" role="group" aria-label="跳转模式">
-          <button type="button" className={redirectMode === "direct" ? "mode-tab active" : "mode-tab"} onClick={() => setRedirectMode("direct")}>
-            直接跳转
-          </button>
-          <button
-            type="button"
-            className={redirectMode === "target_service_forward" ? "mode-tab active" : "mode-tab"}
-            onClick={() => setRedirectMode("target_service_forward")}
-          >
-            目标服务二段跳
-          </button>
-        </div>
-        {redirectMode === "target_service_forward" ? (
-          <>
-            <label>
-              目标服务
-              <select value={targetServiceId} onChange={(event) => setTargetServiceId(event.target.value)} required>
-                <option value="">请选择</option>
-                {targets.map((target) => <option key={target.id} value={target.id}>{target.name} - {target.targetHost}</option>)}
-              </select>
-            </label>
-            <label>
-              二段跳最终 URL
-              <input value={targetForwardHost} onChange={(event) => setTargetForwardHost(event.target.value)} placeholder="https://final.example.com/path/to/page" required />
-            </label>
-          </>
-        ) : (
-          <label>
-            直接跳转到任意 URL
-            <input value={directTargetHost} onChange={(event) => setDirectTargetHost(event.target.value)} placeholder="https://xxxx.google.com/asas/32edsa/?a=1" required />
-          </label>
-        )}
-        <div className="two-col">
-          <label>
-            选择 Group
-            <select value={groupId} onChange={(event) => setGroupId(event.target.value)}>
-              <option value="">不分组</option>
-              {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
-            </select>
-          </label>
-          <label>
-            新建 Group
-            <input value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} placeholder="可选" />
-          </label>
-        </div>
-        <label className="switch">
-          <input type="checkbox" checked={hideReferer} onChange={(event) => setHideReferer(event.target.checked)} />
-          <span>隐藏 Referer</span>
-          <small>使用 no-referrer 中转页，减少来源暴露但不承诺完全不可追踪。</small>
-        </label>
-        <button className="primary" disabled={loading || (redirectMode === "target_service_forward" && targets.length === 0)}>
-          {loading ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-          开始配置
-        </button>
-      </form>
-      <div className="panel">
-        <h2>处理结果</h2>
-        {!result ? (
-          <EmptyState title="等待提交" text="每个域名会独立显示成功、失败或等待生效。" />
-        ) : (
-          <div className="result-list">
-            {result.map((item) => (
-              <div key={item.domain} className={item.ok ? "result ok" : "result fail"}>
-                {item.ok ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
-                <span>{item.domain}</span>
-                <small>{item.ok ? "已创建自动化任务" : item.error}</small>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
 function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCreated: () => Promise<void> }) {
   const [name, setName] = useState("");
   const [targetHost, setTargetHost] = useState("");
@@ -1769,12 +1684,20 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
+    setActionError("");
     try {
-      await api("/api/targets", { method: "POST", body: JSON.stringify({ name, targetHost, forwardTargetHost: "", description }) });
+      const queued = await api<{ jobId: string }>("/api/targets", {
+        method: "POST",
+        body: JSON.stringify({ name, targetHost, forwardTargetHost: "", description }),
+      });
       setName("");
       setTargetHost("");
       setDescription("");
       await onCreated();
+      await waitForOperation(queued.jobId);
+      await onCreated();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "新增目标服务失败。");
     } finally {
       setLoading(false);
     }
@@ -1792,9 +1715,17 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
 
   async function repairTarget(target: TargetService) {
     setRepairingIds((current) => [...new Set([...current, target.id])]);
+    setActionError("");
     try {
-      await api(`/api/targets/${target.id}/repair`, { method: "POST", body: JSON.stringify({}) });
+      const queued = await api<{ jobId: string }>(`/api/targets/${target.id}/repair`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
       await onCreated();
+      await waitForOperation(queued.jobId);
+      await onCreated();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "重新配置失败。");
     } finally {
       setRepairingIds((current) => current.filter((id) => id !== target.id));
     }
@@ -1811,7 +1742,12 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
     setActionError("");
     setDeletingIds((current) => [...new Set([...current, target.id])]);
     try {
-      await api(`/api/targets/${target.id}`, { method: "DELETE", body: JSON.stringify({}) });
+      const queued = await api<{ jobId: string }>(`/api/targets/${target.id}`, {
+        method: "DELETE",
+        headers: { "idempotency-key": crypto.randomUUID() },
+        body: JSON.stringify({}),
+      });
+      await waitForOperation(queued.jobId);
       await onCreated();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "删除目标服务失败。");
@@ -1888,135 +1824,6 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
                     onClick={() => void removeTarget(target)}
                   >
                     {deletingIds.includes(target.id) ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTarget(null)} />}
-    </section>
-  );
-}
-
-function TargetsView({ targets, onCreated }: { targets: TargetService[]; onCreated: () => Promise<void> }) {
-  const [name, setName] = useState("");
-  const [targetHost, setTargetHost] = useState("");
-  const [forwardTargetHost, setForwardTargetHost] = useState("");
-  const [description, setDescription] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [checkingIds, setCheckingIds] = useState<string[]>([]);
-  const [repairingIds, setRepairingIds] = useState<string[]>([]);
-  const [savingForwardIds, setSavingForwardIds] = useState<string[]>([]);
-  const [forwardDrafts, setForwardDrafts] = useState<Record<string, string>>({});
-  const [manualTarget, setManualTarget] = useState<TargetService | null>(null);
-
-  useEffect(() => {
-    setForwardDrafts(Object.fromEntries(targets.map((target) => [target.id, target.forwardTargetHost ?? ""])));
-  }, [targets]);
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    setLoading(true);
-    try {
-      await api("/api/targets", { method: "POST", body: JSON.stringify({ name, targetHost, forwardTargetHost, description }) });
-      setName("");
-      setTargetHost("");
-      setForwardTargetHost("");
-      setDescription("");
-      await onCreated();
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function checkTarget(target: TargetService) {
-    setCheckingIds((current) => [...new Set([...current, target.id])]);
-    try {
-      await api(`/api/targets/${target.id}/check`, { method: "POST", body: JSON.stringify({}) });
-      await onCreated();
-    } finally {
-      setCheckingIds((current) => current.filter((id) => id !== target.id));
-    }
-  }
-
-  async function repairTarget(target: TargetService) {
-    setRepairingIds((current) => [...new Set([...current, target.id])]);
-    try {
-      await api(`/api/targets/${target.id}/repair`, { method: "POST", body: JSON.stringify({}) });
-      await onCreated();
-    } finally {
-      setRepairingIds((current) => current.filter((id) => id !== target.id));
-    }
-  }
-
-  async function saveTargetForward(target: TargetService) {
-    setSavingForwardIds((current) => [...new Set([...current, target.id])]);
-    try {
-      await api(`/api/targets/${target.id}/forward`, {
-        method: "POST",
-        body: JSON.stringify({ forwardTargetHost: forwardDrafts[target.id] ?? "" }),
-      });
-      await onCreated();
-    } finally {
-      setSavingForwardIds((current) => current.filter((id) => id !== target.id));
-    }
-  }
-
-  return (
-    <section className="split">
-      <form className="panel" onSubmit={submit}>
-        <h2>新增目标服务</h2>
-        <label>名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="主短链服务" /></label>
-        <label>服务域名<input value={targetHost} onChange={(event) => setTargetHost(event.target.value)} placeholder="bcd.com" /></label>
-        <label>最终跳转域名<input value={forwardTargetHost} onChange={(event) => setForwardTargetHost(event.target.value)} placeholder="可选，例如 final.example.com" /></label>
-        <label>备注<textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-        <button className="primary" disabled={loading}><Plus size={16} />保存</button>
-        <div className="note">添加完成后等 10 秒后手动刷新确认结果。</div>
-      </form>
-      <div className="panel">
-        <h2>目标服务列表</h2>
-        {targets.length === 0 ? <EmptyState title="暂无目标服务" text="新增跳转前需要先创建目标短链接服务。" /> : (
-          <div className="target-list">
-            {targets.map((target) => (
-              <div key={target.id} className="target-item">
-                <div className="target-main">
-                  <strong>{target.name}</strong>
-                  <small>{target.description || "无备注"}</small>
-                  <small>{target.forwardTargetHost ? `二段跳到 ${target.forwardTargetHost}` : "未配置二段跳"}</small>
-                </div>
-                <div className="target-health">
-                  <Badge status={checkingIds.includes(target.id) || repairingIds.includes(target.id) ? "checking" : target.healthStatus} />
-                  <small>
-                    {target.healthHttpStatus ? `HTTP ${target.healthHttpStatus}` : target.healthError ?? "尚未检测"} · {formatDate(target.healthCheckedAt)}
-                  </small>
-                  <span className="mini-status">
-                    <Badge status={target.nameserverStatus} />
-                    <Badge status={target.dnsStatus} />
-                  </span>
-                </div>
-                <div className="target-actions">
-                  <a href={`https://${target.targetHost}`} target="_blank" rel="noreferrer">{target.targetHost}<ExternalLink size={14} /></a>
-                  <button className="icon" title="配置说明" onClick={() => setManualTarget(target)}>
-                    <Info size={16} />
-                  </button>
-                  <button className="icon" title="重新配置" disabled={repairingIds.includes(target.id)} onClick={() => void repairTarget(target)}>
-                    <Settings className={repairingIds.includes(target.id) ? "spin" : ""} size={16} />
-                  </button>
-                  <button className="icon" title="重新检测" disabled={checkingIds.includes(target.id)} onClick={() => void checkTarget(target)}>
-                    <RefreshCw className={checkingIds.includes(target.id) ? "spin" : ""} size={16} />
-                  </button>
-                </div>
-                <div className="target-forward">
-                  <input
-                    value={forwardDrafts[target.id] ?? ""}
-                    onChange={(event) => setForwardDrafts((current) => ({ ...current, [target.id]: event.target.value }))}
-                    placeholder="最终跳转域名"
-                  />
-                  <button className="ghost" disabled={savingForwardIds.includes(target.id)} onClick={() => void saveTargetForward(target)}>
-                    {savingForwardIds.includes(target.id) ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-                    保存二段跳
                   </button>
                 </div>
               </div>
@@ -2122,31 +1929,77 @@ function ManualConfigModal({ target, onClose }: { target: TargetService; onClose
 function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null }) {
   const [domains, setDomains] = useState("");
   const [registrarId, setRegistrarId] = useState("dynadot");
-  const [results, setResults] = useState<NameserverToolResult[] | null>(null);
-  const [resultTotal, setResultTotal] = useState(0);
+  const [results, setResults] = useState<NameserverToolResult[] | null>(
+    () => loadStoredResults<NameserverToolResult>(NAMESERVER_RESULTS_STORAGE_KEY),
+  );
+  const [resultTotal, setResultTotal] = useState(
+    () => loadStoredResults<NameserverToolResult>(NAMESERVER_RESULTS_STORAGE_KEY)?.length ?? 0,
+  );
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [retryingDomains, setRetryingDomains] = useState<string[]>([]);
   const dynadot = registrars?.providers.find((provider) => provider.id === "dynadot");
 
-  async function runOneDomain(domain: string): Promise<NameserverToolResult> {
+  useEffect(() => {
+    if (results) {
+      window.localStorage.setItem(NAMESERVER_RESULTS_STORAGE_KEY, JSON.stringify(results));
+    } else {
+      window.localStorage.removeItem(NAMESERVER_RESULTS_STORAGE_KEY);
+    }
+  }, [results]);
+
+  const pendingOperationIds = useMemo(
+    () => loading ? [] : results?.filter((item) => item.jobId && isProcessingStatus(item.status)).map((item) => item.jobId!) ?? [],
+    [loading, results],
+  );
+  const refreshOperation = useCallback(async (jobId: string, signal: AbortSignal) => {
+    const job = await api<OperationJob>(`/api/jobs/${jobId}`, undefined, { timeoutMs: 15_000, signal });
+    setResults((current) => current?.map((item) => {
+      if (item.jobId !== jobId) {
+        return item;
+      }
+      if (job.status === "completed") {
+        return { ...item, ...operationResult<NameserverToolResult>(job), jobId };
+      }
+      if (job.status === "failed") {
+        return { ...item, ok: false, status: "failed", message: job.errorMessage ?? "Nameserver 接入失败。" };
+      }
+      return { ...item, status: job.status, message: statusText(job.status) };
+    }) ?? current);
+  }, []);
+  useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS);
+
+  async function runOneDomain(domain: string, requestKey: string = crypto.randomUUID()): Promise<NameserverToolResult> {
+    let started: NameserverToolResult = {
+      domain,
+      ok: true,
+      status: "queued",
+      message: "已加入串行处理队列。",
+      nameservers: [],
+      requestKey,
+    };
     try {
       const data = await api<{ results: NameserverToolResult[] }>(
         "/api/nameserver-tool",
         {
           method: "POST",
+          headers: { "idempotency-key": requestKey },
           body: JSON.stringify({ domains: domain, registrarId }),
         },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      return data.results[0] ?? { domain, ok: false, status: "failed", message: "服务端没有返回处理结果。", nameservers: [] };
+      started = { ...(data.results[0] ?? started), requestKey };
+      if (!started.jobId) {
+        throw new Error("服务端没有返回任务 ID。");
+      }
+      const job = await waitForOperation(started.jobId);
+      return { ...started, ...operationResult<NameserverToolResult>(job), jobId: started.jobId, requestKey };
     } catch (err) {
       return {
-        domain,
+        ...started,
         ok: false,
         status: "failed",
         message: err instanceof Error ? err.message : "Nameserver 接入失败。",
-        nameservers: [],
       };
     }
   }
@@ -2166,20 +2019,30 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
     setLoading(true);
     setMessage("");
     try {
-      const domainItems = splitDomainInput(domains);
+      const domainItems = [...new Set(splitDomainInput(domains))];
       if (domainItems.length === 0) {
         setMessage("请至少输入一个域名。");
         return;
       }
-      const nextResults: NameserverToolResult[] = [];
       setResultTotal(domainItems.length);
-      setResults([]);
-      for (const domain of domainItems) {
-        nextResults.push({ domain, ok: true, status: "queued", message: "处理中...", nameservers: [] });
-        setResults([...nextResults]);
-        nextResults[nextResults.length - 1] = await runOneDomain(domain);
-        setResults([...nextResults]);
-      }
+      const initial = domainItems.map((domain): NameserverToolResult => ({
+        domain,
+        ok: true,
+        status: "pending",
+        message: "等待处理...",
+        nameservers: [],
+        requestKey: crypto.randomUUID(),
+      }));
+      setResults(initial);
+      await runSerialBatch(
+        initial,
+        (item) => runOneDomain(item.domain, item.requestKey),
+        (item, outcome) => setResults((current) => current?.map((entry) => (
+          entry.domain === item.domain
+            ? outcome.ok ? outcome.value : { ...entry, ok: false, status: "failed", message: outcome.error.message }
+            : entry
+        )) ?? current),
+      );
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Nameserver 接入失败。");
     } finally {
@@ -2220,7 +2083,10 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
         <div className="panel-head">
           <h2>处理结果</h2>
           <ResultSummary items={results} total={resultTotal} />
-          <button className="ghost" type="button" disabled={!results} onClick={() => setResults(null)}>
+          <button className="ghost" type="button" disabled={!results} onClick={() => {
+            setResults(null);
+            setResultTotal(0);
+          }}>
             <X size={16} />
             清空结果
           </button>
@@ -2266,7 +2132,12 @@ function CloudflareZoneDeleteView() {
   const [zones, setZones] = useState<CloudflareZoneItem[]>([]);
   const [selectedZoneIds, setSelectedZoneIds] = useState<string[]>([]);
   const [zoneSearch, setZoneSearch] = useState("");
-  const [results, setResults] = useState<CloudflareDeleteResult[] | null>(null);
+  const [results, setResults] = useState<CloudflareDeleteResult[] | null>(
+    () => loadStoredResults<CloudflareDeleteResult>(ZONE_DELETE_RESULTS_STORAGE_KEY),
+  );
+  const [resultTotal, setResultTotal] = useState(
+    () => loadStoredResults<CloudflareDeleteResult>(ZONE_DELETE_RESULTS_STORAGE_KEY)?.length ?? 0,
+  );
   const [loadingZones, setLoadingZones] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -2290,23 +2161,69 @@ function CloudflareZoneDeleteView() {
     void loadZones();
   }, []);
 
+  useEffect(() => {
+    if (results) {
+      window.localStorage.setItem(ZONE_DELETE_RESULTS_STORAGE_KEY, JSON.stringify(results));
+    } else {
+      window.localStorage.removeItem(ZONE_DELETE_RESULTS_STORAGE_KEY);
+    }
+  }, [results]);
+
+  const pendingOperationIds = useMemo(
+    () => loading ? [] : results?.filter((item) => item.jobId && isProcessingStatus(item.status)).map((item) => item.jobId!) ?? [],
+    [loading, results],
+  );
+  const refreshOperation = useCallback(async (jobId: string, signal: AbortSignal) => {
+    const job = await api<OperationJob>(`/api/jobs/${jobId}`, undefined, { timeoutMs: 15_000, signal });
+    const completedResult = job.status === "completed" ? operationResult<CloudflareDeleteResult>(job) : null;
+    if (job.status === "completed") {
+      setZones((current) => current.filter((zone) => zone.name !== job.subjectId));
+    }
+    setResults((current) => current?.map((item) => {
+      if (item.jobId !== jobId) {
+        return item;
+      }
+      if (job.status === "completed") {
+        return { ...item, ...completedResult, jobId };
+      }
+      if (job.status === "failed") {
+        return { ...item, ok: false, status: "failed", message: job.errorMessage ?? "删除 Cloudflare Zone 失败。" };
+      }
+      return { ...item, status: job.status, message: statusText(job.status) };
+    }) ?? current);
+  }, []);
+  useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS);
+
   const filteredZones = zones.filter((zone) => zone.name.includes(zoneSearch.trim().toLowerCase()));
   const selectedZones = zones.filter((zone) => selectedZoneIds.includes(zone.id));
 
-  async function deleteOneDomain(domain: string): Promise<CloudflareDeleteResult> {
+  async function deleteOneDomain(domain: string, requestKey: string = crypto.randomUUID()): Promise<CloudflareDeleteResult> {
+    let started: CloudflareDeleteResult = {
+      domain,
+      ok: true,
+      status: "queued",
+      message: "已加入串行删除队列。",
+      requestKey,
+    };
     try {
       const data = await api<{ results: CloudflareDeleteResult[] }>(
         "/api/cloudflare-zones/delete",
         {
           method: "POST",
+          headers: { "idempotency-key": requestKey },
           body: JSON.stringify({ domains: domain, confirmDelete: true }),
         },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      return data.results[0] ?? { domain, ok: false, status: "failed", message: "服务端没有返回删除结果。" };
+      started = { ...(data.results[0] ?? started), requestKey };
+      if (!started.jobId) {
+        throw new Error("服务端没有返回任务 ID。");
+      }
+      const job = await waitForOperation(started.jobId);
+      return { ...started, ...operationResult<CloudflareDeleteResult>(job), jobId: started.jobId, requestKey };
     } catch (err) {
       return {
-        domain,
+        ...started,
         ok: false,
         status: "failed",
         message: err instanceof Error ? err.message : "删除 Cloudflare Zone 失败。",
@@ -2346,19 +2263,29 @@ function CloudflareZoneDeleteView() {
     setMessage("");
     setLoading(true);
     try {
-      const domainItems = splitDomainInput(domainText);
-      const nextResults: CloudflareDeleteResult[] = [];
-      setResults([]);
-      for (const domain of domainItems) {
-        nextResults.push({ domain, ok: true, status: "queued", message: "删除中..." });
-        setResults([...nextResults]);
-        const next = await deleteOneDomain(domain);
-        nextResults[nextResults.length - 1] = next;
-        setResults([...nextResults]);
-        if (next.status === "deleted" || next.status === "not_found") {
-          setZones((current) => current.filter((zone) => zone.name !== next.domain));
-        }
-      }
+      const domainItems = [...new Set(splitDomainInput(domainText))];
+      const initial = domainItems.map((domain): CloudflareDeleteResult => ({
+        domain,
+        ok: true,
+        status: "pending",
+        message: "等待删除...",
+        requestKey: crypto.randomUUID(),
+      }));
+      setResultTotal(initial.length);
+      setResults(initial);
+      await runSerialBatch(
+        initial,
+        (item) => deleteOneDomain(item.domain, item.requestKey),
+        (item, outcome) => {
+          const next = outcome.ok
+            ? outcome.value
+            : { ...item, ok: false, status: "failed", message: outcome.error.message };
+          setResults((current) => current?.map((entry) => entry.domain === item.domain ? next : entry) ?? current);
+          if (next.status === "deleted" || next.status === "not_found") {
+            setZones((current) => current.filter((zone) => zone.name !== next.domain));
+          }
+        },
+      );
       setSelectedZoneIds([]);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "删除 Cloudflare Zone 失败。");
@@ -2474,7 +2401,11 @@ function CloudflareZoneDeleteView() {
 
         <div className="panel-head result-head">
           <h2>删除结果</h2>
-          <button className="ghost" type="button" disabled={!results} onClick={() => setResults(null)}>
+          <ResultSummary items={results} total={resultTotal} />
+          <button className="ghost" type="button" disabled={!results} onClick={() => {
+            setResults(null);
+            setResultTotal(0);
+          }}>
             <X size={16} />
             清空结果
           </button>

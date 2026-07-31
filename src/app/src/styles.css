@@ -502,6 +502,7 @@ small,
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   margin-bottom: 16px;
 }
 
@@ -655,6 +656,12 @@ form.panel {
 .check-grid {
   display: grid;
   gap: 10px;
+}
+
+.split > .panel .result-list {
+  max-height: calc(100vh - 190px);
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .short-result {

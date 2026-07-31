@@ -32,7 +32,7 @@ export default {
       const assets = Reflect.get(env, "ASSETS") as Fetcher | undefined;
       return assets ? assets.fetch(request) : staticResponse(url.pathname) ?? new Response("Not found", { status: 404 });
     }
-    const targetResponse = await handleTargetService(request, env);
+    const targetResponse = await handleTargetService(request, env, ctx);
     if (targetResponse) {
       return targetResponse;
     }

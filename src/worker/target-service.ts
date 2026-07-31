@@ -28,7 +28,7 @@ function html(targetHost: string): string {
 </html>`;
 }
 
-export async function handleTargetService(request: Request, env: Env): Promise<Response | null> {
+export async function handleTargetService(request: Request, env: Env, ctx: ExecutionContext): Promise<Response | null> {
   const url = new URL(request.url);
   const host = url.host.split(":")[0]?.toLowerCase() ?? url.hostname.toLowerCase();
   const target = await findTargetByHost(env.DB, host);
@@ -57,7 +57,13 @@ export async function handleTargetService(request: Request, env: Env): Promise<R
     const shortLink = await findShortLinkByCode(env.DB, target.targetHost, shortCodeMatch[1]);
     if (shortLink) {
       if (shouldRecordPageView(request)) {
-        await recordShortLinkVisit(env.DB, shortLink.id, await visitorKeyFromRequest(request, env, host));
+        ctx.waitUntil(
+          (async () => recordShortLinkVisit(
+            env.DB,
+            shortLink.id,
+            await visitorKeyFromRequest(request, env, host),
+          ))(),
+        );
       }
       if (shortLink.hideReferer && request.method === "GET") {
         return noRefererHtml(shortLink.originalUrl);

@@ -12,7 +12,7 @@ A Cloudflare-native redirect management app for operating many entry domains fro
 - Cloudflare NS intake tool for domains from any registrar.
 - Cloudflare Zone deletion helper.
 - Short link generation on configured target service domains.
-- Visit recording in D1: detailed events plus daily aggregate statistics.
+- Traffic uses one privacy-safe IP hash per domain or short link per Shanghai calendar day; duplicate page requests add request volume but not UV.
 - Frontend-driven one-at-a-time batch processing to avoid Cloudflare Worker subrequest limits.
 
 ## Security Notice
@@ -123,13 +123,13 @@ Apply migrations locally:
 npx wrangler d1 migrations apply multi-domain-redirect-manager --local
 ```
 
-For an existing deployment, configure all production secrets above and deploy the updated Worker before applying remote migrations. Confirm the initialization check can read Cloudflare and Dynadot configuration, then run:
+For an existing deployment, first create the ignored deployment-only `.wrangler/deploy.jsonc` with the real D1 database ID, `ADMIN_HOST`, and custom-domain route. Configure all production secrets above, back up D1, deploy the updated Worker, then apply remote migrations:
 
 ```bash
 npx wrangler d1 migrations apply multi-domain-redirect-manager --remote
 ```
 
-Migration `0017` removes legacy provider credentials from D1, so applying it before the Worker reads Wrangler Secrets can interrupt automation.
+Migration `0017` removes legacy provider credentials from D1, so applying it before the Worker reads Wrangler Secrets can interrupt automation. Migration `0019` adds the daily visitor facts table; it is additive and does not retain raw IP addresses.
 
 ## Cloudflare API Token Permissions
 
@@ -156,6 +156,8 @@ Deploy:
 ```bash
 npm run deploy
 ```
+
+Turnstile verification is intentionally disabled in this release. Do not enable it until a separate non-production cross-origin browser validation has passed.
 
 After deployment:
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { shouldRecordPageView, visitorKeyFromRequest } from "../src/worker/redirect";
+import { today } from "../src/worker/shared";
 
 function request(path: string, headers: Record<string, string> = {}, method = "GET"): Request {
   return new Request(`https://example.com${path}`, { method, headers });
@@ -43,5 +44,9 @@ describe("redirect visit accounting", () => {
     expect(first).toBe(second);
     expect(first).toHaveLength(64);
     expect(first).not.toContain("203.0.113.10");
+  });
+
+  it("uses Shanghai calendar days for daily visitor accounting", () => {
+    expect(today(new Date("2026-07-31T18:00:00.000Z"))).toBe("2026-08-01");
   });
 });

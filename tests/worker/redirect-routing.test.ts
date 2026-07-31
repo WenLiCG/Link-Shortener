@@ -61,11 +61,15 @@ describe("redirect traffic writes", () => {
     };
 
     expect((await SELF.fetch("https://entry.example.com/", { redirect: "manual", headers })).status).toBe(302);
+    expect((await SELF.fetch("https://entry.example.com/another-page", { redirect: "manual", headers })).status).toBe(302);
     expect((await SELF.fetch("https://entry.example.com/app.js", {
       redirect: "manual",
       headers: { ...headers, "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors" },
     })).status).toBe(302);
 
     await eventually("SELECT COUNT(*) AS total FROM visit_events WHERE redirect_domain_id = 'domain-visit'", 1);
+    await eventually("SELECT COUNT(*) AS total FROM traffic_daily_visitors WHERE subject_id = 'domain-visit'", 1);
+    await eventually("SELECT filtered_uv AS total FROM traffic_daily_stats WHERE subject_id = 'domain-visit'", 1);
+    await eventually("SELECT request_count AS total FROM traffic_daily_stats WHERE subject_id = 'domain-visit'", 2);
   });
 });

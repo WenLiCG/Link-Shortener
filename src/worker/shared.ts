@@ -284,12 +284,10 @@ export function noRefererRedirect(targetUrl: string, status = 302): Response {
   });
 }
 
-export function daysAgo(days: number): string {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() - days);
-  return date.toISOString().slice(0, 10);
+export function daysAgo(days: number, now = new Date()): string {
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000 - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
-export function today(): string {
-  return new Date().toISOString().slice(0, 10);
+export function today(now = new Date()): string {
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }

@@ -47,6 +47,17 @@ function getClientIp(request: Request): string | null {
   return forwarded || null;
 }
 
+function refererHost(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
 async function sha256Hex(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -155,6 +166,7 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
           browser: client.browser,
           deviceType: client.deviceType,
           userAgent,
+          refererHost: refererHost(request.headers.get("referer")),
           targetHost: domain.redirectMode === "direct" ? domain.directTargetHost ?? domain.targetHost : domain.targetHost,
           hideReferer: domain.hideReferer,
           visitorKey: await visitorKeyFromRequest(request, env, host),

@@ -401,21 +401,34 @@ export async function shortLinkCodeExists(db: D1Database, targetServiceId: strin
 }
 
 export async function recordShortLinkVisit(db: D1Database, id: string, visitorKey: string): Promise<void> {
+  const day = today();
   const unique = await db
-    .prepare("INSERT OR IGNORE INTO short_link_daily_uniques (short_link_id, day, visitor_key) VALUES (?, ?, ?)")
-    .bind(id, today(), visitorKey)
+    .prepare(
+      `INSERT OR IGNORE INTO traffic_daily_visitors
+       (subject_type, subject_id, day, visitor_key, first_seen_at)
+       VALUES ('short_link', ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+    )
+    .bind(id, day, visitorKey)
     .run();
   const increment = (unique.meta.changes ?? 0) > 0 ? 1 : 0;
-  await db
-    .prepare(
+  await db.batch([
+    db.prepare(
       `UPDATE short_links
        SET visit_count = visit_count + ?,
            last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
        WHERE id = ?`,
     )
-    .bind(increment, id)
-    .run();
+      .bind(increment, id),
+    db.prepare(
+      `INSERT INTO traffic_daily_stats (subject_type, subject_id, day, request_count, filtered_uv, last_accessed_at)
+       VALUES ('short_link', ?, ?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       ON CONFLICT(subject_type, subject_id, day) DO UPDATE SET
+         request_count = request_count + 1,
+         filtered_uv = (SELECT COUNT(*) FROM traffic_daily_visitors WHERE subject_type = 'short_link' AND subject_id = excluded.subject_id AND day = excluded.day),
+         last_accessed_at = excluded.last_accessed_at`,
+    ).bind(id, day, increment),
+  ]);
 }
 
 export async function deleteShortLinks(db: D1Database, ids: string[]): Promise<number> {
@@ -588,11 +601,11 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
           ELSE t.name
         END AS target_name,
         g.name AS group_name,
-        COALESCE(SUM(s.visits), 0) AS traffic
+        COALESCE(SUM(s.filtered_uv), 0) AS traffic
        FROM redirect_domains d
        LEFT JOIN target_services t ON t.id = d.target_service_id
        LEFT JOIN groups g ON g.id = d.group_id
-       LEFT JOIN visit_daily_stats s ON s.redirect_domain_id = d.id
+       LEFT JOIN traffic_daily_stats s ON s.subject_type = 'redirect_domain' AND s.subject_id = d.id
        ${where}
        GROUP BY d.id
        ORDER BY d.created_at DESC`,
@@ -649,10 +662,10 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const sources = (
     await all(
       db,
-      `SELECT COALESCE(NULLIF(referer, ''), '直接访问') AS referer, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
-       GROUP BY COALESCE(NULLIF(referer, ''), '直接访问')
+      `SELECT COALESCE(NULLIF(referer_host, ''), '直接访问') AS referer, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
+       GROUP BY COALESCE(NULLIF(referer_host, ''), '直接访问')
        ORDER BY visits DESC
        LIMIT 20`,
       id,
@@ -661,8 +674,8 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const trend = (
     await all(
       db,
-      `SELECT day, visits FROM visit_daily_stats
-       WHERE redirect_domain_id = ? AND day >= ?
+      `SELECT day, filtered_uv AS visits FROM traffic_daily_stats
+       WHERE subject_type = 'redirect_domain' AND subject_id = ? AND day >= ?
        ORDER BY day ASC`,
       id,
       daysAgo(30),
@@ -671,9 +684,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const countries = (
     await all(
       db,
-      `SELECT country, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT country, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY country
        ORDER BY visits DESC
        LIMIT 50`,
@@ -683,9 +696,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const regions = (
     await all(
       db,
-      `SELECT country, region, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT country, region, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY country, region
        ORDER BY visits DESC
        LIMIT 50`,
@@ -695,9 +708,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const cities = (
     await all(
       db,
-      `SELECT country, region, city, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT country, region, city, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY country, region, city
        ORDER BY visits DESC
        LIMIT 50`,
@@ -712,9 +725,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const locations = (
     await all(
       db,
-      `SELECT country, city, latitude, longitude, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT country, city, latitude, longitude, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
          AND latitude IS NOT NULL
          AND longitude IS NOT NULL
        GROUP BY country, city, latitude, longitude
@@ -736,9 +749,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const languages = (
     await all(
       db,
-      `SELECT language, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT language, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY language
        ORDER BY visits DESC
        LIMIT 20`,
@@ -748,9 +761,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const timezones = (
     await all(
       db,
-      `SELECT timezone, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT timezone, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY timezone
        ORDER BY visits DESC
        LIMIT 20`,
@@ -760,9 +773,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const operatingSystems = (
     await all(
       db,
-      `SELECT operating_system, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT operating_system, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY operating_system
        ORDER BY visits DESC
        LIMIT 20`,
@@ -772,9 +785,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const browsers = (
     await all(
       db,
-      `SELECT browser, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT browser, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY browser
        ORDER BY visits DESC
        LIMIT 20`,
@@ -784,9 +797,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const deviceTypes = (
     await all(
       db,
-      `SELECT device_type, COUNT(DISTINCT ${VISITOR_ID_SQL}) AS visits
-       FROM visit_events
-       WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
+      `SELECT device_type, COUNT(*) AS visits
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
        GROUP BY device_type
        ORDER BY visits DESC
        LIMIT 20`,
@@ -1068,6 +1081,7 @@ export async function recordVisit(
     browser: string | null;
     deviceType: string | null;
     userAgent: string | null;
+    refererHost: string | null;
     targetHost: string;
     hideReferer: boolean;
     visitorKey: string;
@@ -1076,15 +1090,16 @@ export async function recordVisit(
 ): Promise<void> {
   const day = today();
   const now = new Date().toISOString();
-  let visitIncrement = 0;
-  if (!input.isBot) {
-    const unique = await db
-      .prepare("INSERT OR IGNORE INTO visit_daily_uniques (redirect_domain_id, day, visitor_key) VALUES (?, ?, ?)")
-      .bind(input.redirectDomainId, day, input.visitorKey)
-      .run();
-    visitIncrement = (unique.meta.changes ?? 0) > 0 ? 1 : 0;
-  }
-  await db.batch([
+  const unique = input.isBot ? null : await db
+    .prepare(
+      `INSERT OR IGNORE INTO traffic_daily_visitors
+       (subject_type, subject_id, day, visitor_key, first_seen_at, referer_host, country, region, city, latitude, longitude, timezone, language, operating_system, browser, device_type)
+       VALUES ('redirect_domain', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(input.redirectDomainId, day, input.visitorKey, now, input.refererHost, input.country, input.region, input.city, input.latitude, input.longitude, input.timezone, input.language, input.operatingSystem, input.browser, input.deviceType)
+    .run();
+  const visitIncrement = (unique?.meta.changes ?? 0) > 0 ? 1 : 0;
+  const statements = [
     db
       .prepare(
         `INSERT INTO visit_events
@@ -1124,9 +1139,20 @@ export async function recordVisit(
       )
       .bind(input.redirectDomainId, day, visitIncrement, now),
     db
+      .prepare(
+        `INSERT INTO traffic_daily_stats (subject_type, subject_id, day, request_count, filtered_uv, last_accessed_at)
+         VALUES ('redirect_domain', ?, ?, 1, ?, ?)
+         ON CONFLICT(subject_type, subject_id, day) DO UPDATE SET
+           request_count = request_count + 1,
+           filtered_uv = (SELECT COUNT(*) FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND subject_id = excluded.subject_id AND day = excluded.day),
+           last_accessed_at = excluded.last_accessed_at`,
+      )
+      .bind(input.redirectDomainId, day, visitIncrement, now),
+    db
       .prepare("UPDATE redirect_domains SET last_accessed_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
       .bind(now, input.redirectDomainId),
-  ]);
+  ];
+  await db.batch(visitIncrement ? statements : statements.slice(1));
 }
 
 export async function summaryStats(db: D1Database): Promise<SummaryStats> {
@@ -1139,8 +1165,8 @@ export async function summaryStats(db: D1Database): Promise<SummaryStats> {
      FROM redirect_domains
      WHERE list_visible = 1`,
   );
-  const visits = await first(db, "SELECT COALESCE(SUM(visits), 0) AS visits FROM visit_daily_stats");
-  const visitsToday = await first(db, "SELECT COALESCE(SUM(visits), 0) AS visits FROM visit_daily_stats WHERE day = ?", today());
+  const visits = await first(db, "SELECT COALESCE(SUM(filtered_uv), 0) AS visits FROM traffic_daily_stats WHERE subject_type = 'redirect_domain'");
+  const visitsToday = await first(db, "SELECT COALESCE(SUM(filtered_uv), 0) AS visits FROM traffic_daily_stats WHERE subject_type = 'redirect_domain' AND day = ?", today());
   return {
     totalDomains: numberValue(domainStats?.total ?? 0),
     activeDomains: numberValue(domainStats?.active ?? 0),

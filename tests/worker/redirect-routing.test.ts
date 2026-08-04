@@ -1,5 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { listShortLinks } from "../../src/worker/db";
 
 async function eventually(query: string, expected: number): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -13,6 +14,9 @@ async function eventually(query: string, expected: number): Promise<void> {
 }
 
 beforeEach(async () => {
+  await env.DB.prepare("DELETE FROM traffic_daily_visitors").run();
+  await env.DB.prepare("DELETE FROM traffic_daily_stats").run();
+  await env.DB.prepare("DELETE FROM visit_daily_stats").run();
   await env.DB.prepare("DELETE FROM visit_events").run();
   await env.DB.prepare("DELETE FROM short_link_daily_uniques").run();
   await env.DB.prepare("DELETE FROM short_links").run();
@@ -43,7 +47,9 @@ describe("redirect traffic writes", () => {
 
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toBe("https://destination.example/path");
-    await eventually("SELECT visit_count AS total FROM short_links WHERE id = 'short-1'", 1);
+    await eventually("SELECT COUNT(*) AS total FROM traffic_daily_visitors WHERE subject_id = 'short-1'", 1);
+    expect(Number(await env.DB.prepare("SELECT visit_count AS total FROM short_links WHERE id = 'short-1'").first("total"))).toBe(0);
+    expect((await listShortLinks(env.DB)).find((link) => link.id === "short-1")?.visitCount).toBe(1);
   });
 
   it("records a page navigation but ignores an asset request", async () => {
@@ -67,9 +73,9 @@ describe("redirect traffic writes", () => {
       headers: { ...headers, "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors" },
     })).status).toBe(302);
 
-    await eventually("SELECT COUNT(*) AS total FROM visit_events WHERE redirect_domain_id = 'domain-visit'", 1);
     await eventually("SELECT COUNT(*) AS total FROM traffic_daily_visitors WHERE subject_id = 'domain-visit'", 1);
-    await eventually("SELECT filtered_uv AS total FROM traffic_daily_stats WHERE subject_id = 'domain-visit'", 1);
-    await eventually("SELECT request_count AS total FROM traffic_daily_stats WHERE subject_id = 'domain-visit'", 2);
+    expect(Number(await env.DB.prepare("SELECT COUNT(*) AS total FROM visit_events WHERE redirect_domain_id = 'domain-visit'").first("total"))).toBe(0);
+    expect(Number(await env.DB.prepare("SELECT COUNT(*) AS total FROM traffic_daily_stats WHERE subject_id = 'domain-visit'").first("total"))).toBe(0);
+    expect(Number(await env.DB.prepare("SELECT COUNT(*) AS total FROM visit_daily_stats WHERE redirect_domain_id = 'domain-visit'").first("total"))).toBe(0);
   });
 });

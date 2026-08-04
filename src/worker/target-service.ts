@@ -58,11 +58,12 @@ export async function handleTargetService(request: Request, env: Env, ctx: Execu
     if (shortLink) {
       if (shouldRecordPageView(request)) {
         ctx.waitUntil(
-          (async () => recordShortLinkVisit(
-            env.DB,
-            shortLink.id,
-            await visitorKeyFromRequest(request, env, host),
-          ))(),
+          (async () => {
+            const visitorKey = await visitorKeyFromRequest(request, env, shortLink.id);
+            if (visitorKey) {
+              await recordShortLinkVisit(env.DB, shortLink.id, visitorKey);
+            }
+          })(),
         );
       }
       if (shortLink.hideReferer && request.method === "GET") {

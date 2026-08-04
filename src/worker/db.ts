@@ -47,49 +47,6 @@ function optionalNumber(value: RowValue): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-const PAGE_VIEW_EVENT_FILTER = `lower(path) NOT IN (
-  '/favicon.ico',
-  '/robots.txt',
-  '/sitemap.xml',
-  '/apple-touch-icon.png',
-  '/apple-touch-icon-precomposed.png',
-  '/browserconfig.xml',
-  '/manifest.json',
-  '/site.webmanifest'
-)
-AND lower(path) NOT GLOB '*.avif'
-AND lower(path) NOT GLOB '*.css'
-AND lower(path) NOT GLOB '*.gif'
-AND lower(path) NOT GLOB '*.ico'
-AND lower(path) NOT GLOB '*.jpg'
-AND lower(path) NOT GLOB '*.jpeg'
-AND lower(path) NOT GLOB '*.js'
-AND lower(path) NOT GLOB '*.json'
-AND lower(path) NOT GLOB '*.map'
-AND lower(path) NOT GLOB '*.png'
-AND lower(path) NOT GLOB '*.svg'
-AND lower(path) NOT GLOB '*.webp'
-AND lower(path) NOT GLOB '*.woff'
-AND lower(path) NOT GLOB '*.woff2'
-AND lower(path) NOT GLOB '*.xml'
-AND lower(path) NOT GLOB '*.txt'`;
-
-const HUMAN_PAGE_VIEW_EVENT_FILTER = `${PAGE_VIEW_EVENT_FILTER}
-AND COALESCE(is_bot, 0) = 0
-AND lower(COALESCE(user_agent, '')) NOT GLOB '*bot*'
-AND lower(COALESCE(user_agent, '')) NOT GLOB '*crawler*'
-AND lower(COALESCE(user_agent, '')) NOT GLOB '*spider*'
-AND lower(COALESCE(user_agent, '')) NOT GLOB '*preview*'
-AND lower(COALESCE(user_agent, '')) NOT GLOB '*monitor*'`;
-
-const VISITOR_ID_SQL = `COALESCE(
-  visitor_key,
-  lower(COALESCE(country, '')) || '|' ||
-  lower(COALESCE(city, '')) || '|' ||
-  lower(COALESCE(user_agent, '')) || '|' ||
-  lower(COALESCE(referer, ''))
-)`;
-
 function parseJsonArray(value: RowValue): string[] {
   if (typeof value !== "string" || value.length === 0) {
     return [];
@@ -163,10 +120,10 @@ function mapShortLink(row: Row): ShortLink {
     shortUrl: `https://${targetHost}/${code}`,
     originalUrl: text(row.original_url),
     hideReferer: bool(row.hide_referer),
-    visitCount: numberValue(row.visit_count),
+    visitCount: numberValue(row.traffic_visit_count ?? row.visit_count),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
-    lastAccessedAt: optionalText(row.last_accessed_at),
+    lastAccessedAt: optionalText(row.traffic_last_accessed_at ?? row.last_accessed_at),
   };
 }
 
@@ -197,7 +154,7 @@ function mapDomain(row: Row): RedirectDomain {
     lastCheckedAt: optionalText(row.last_checked_at),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
-    lastAccessedAt: optionalText(row.last_accessed_at),
+    lastAccessedAt: optionalText(row.traffic_last_accessed_at ?? row.last_accessed_at),
     traffic: numberValue(row.traffic),
   };
 }
@@ -350,7 +307,9 @@ export async function listShortLinks(db: D1Database): Promise<ShortLink[]> {
   return (
     await all(
       db,
-      `SELECT s.*, t.target_host
+      `SELECT s.*, t.target_host,
+         (SELECT COUNT(*) FROM traffic_daily_visitors v WHERE v.subject_type = 'short_link' AND v.subject_id = s.id) AS traffic_visit_count,
+         (SELECT MAX(first_seen_at) FROM traffic_daily_visitors v WHERE v.subject_type = 'short_link' AND v.subject_id = s.id) AS traffic_last_accessed_at
        FROM short_links s
        JOIN target_services t ON t.id = s.target_service_id
        ORDER BY s.created_at DESC`,
@@ -402,7 +361,7 @@ export async function shortLinkCodeExists(db: D1Database, targetServiceId: strin
 
 export async function recordShortLinkVisit(db: D1Database, id: string, visitorKey: string): Promise<void> {
   const day = today();
-  const unique = await db
+  await db
     .prepare(
       `INSERT OR IGNORE INTO traffic_daily_visitors
        (subject_type, subject_id, day, visitor_key, first_seen_at)
@@ -410,25 +369,6 @@ export async function recordShortLinkVisit(db: D1Database, id: string, visitorKe
     )
     .bind(id, day, visitorKey)
     .run();
-  const increment = (unique.meta.changes ?? 0) > 0 ? 1 : 0;
-  await db.batch([
-    db.prepare(
-      `UPDATE short_links
-       SET visit_count = visit_count + ?,
-           last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?`,
-    )
-      .bind(increment, id),
-    db.prepare(
-      `INSERT INTO traffic_daily_stats (subject_type, subject_id, day, request_count, filtered_uv, last_accessed_at)
-       VALUES ('short_link', ?, ?, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-       ON CONFLICT(subject_type, subject_id, day) DO UPDATE SET
-         request_count = request_count + 1,
-         filtered_uv = (SELECT COUNT(*) FROM traffic_daily_visitors WHERE subject_type = 'short_link' AND subject_id = excluded.subject_id AND day = excluded.day),
-         last_accessed_at = excluded.last_accessed_at`,
-    ).bind(id, day, increment),
-  ]);
 }
 
 export async function deleteShortLinks(db: D1Database, ids: string[]): Promise<number> {
@@ -601,11 +541,11 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
           ELSE t.name
         END AS target_name,
         g.name AS group_name,
-        COALESCE(SUM(s.filtered_uv), 0) AS traffic
+        COALESCE((SELECT COUNT(*) FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id), 0) AS traffic,
+        (SELECT MAX(first_seen_at) FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id) AS traffic_last_accessed_at
        FROM redirect_domains d
        LEFT JOIN target_services t ON t.id = d.target_service_id
        LEFT JOIN groups g ON g.id = d.group_id
-       LEFT JOIN traffic_daily_stats s ON s.subject_type = 'redirect_domain' AND s.subject_id = d.id
        ${where}
        GROUP BY d.id
        ORDER BY d.created_at DESC`,
@@ -674,8 +614,9 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const trend = (
     await all(
       db,
-      `SELECT day, filtered_uv AS visits FROM traffic_daily_stats
+      `SELECT day, COUNT(*) AS visits FROM traffic_daily_visitors
        WHERE subject_type = 'redirect_domain' AND subject_id = ? AND day >= ?
+       GROUP BY day
        ORDER BY day ASC`,
       id,
       daysAgo(30),
@@ -809,26 +750,19 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
   const recentVisits = (
     await all(
       db,
-      `WITH ranked_visits AS (
-         SELECT *,
-           ROW_NUMBER() OVER (
-             PARTITION BY date(visited_at), ${VISITOR_ID_SQL}
-             ORDER BY visited_at DESC
-           ) AS visit_rank
-         FROM visit_events
-         WHERE redirect_domain_id = ? AND ${HUMAN_PAGE_VIEW_EVENT_FILTER}
-       )
-       SELECT * FROM ranked_visits
-       WHERE visit_rank = 1
-       ORDER BY visited_at DESC
+      `SELECT ROW_NUMBER() OVER (ORDER BY first_seen_at DESC) AS id,
+         first_seen_at, referer_host, country, region, city, timezone, latitude, longitude, language, operating_system, browser, device_type
+       FROM traffic_daily_visitors
+       WHERE subject_type = 'redirect_domain' AND subject_id = ?
+       ORDER BY first_seen_at DESC
        LIMIT 50`,
       id,
     )
   ).map((row) => ({
     id: text(row.id),
-    host: text(row.host),
-    path: text(row.path),
-    referer: optionalText(row.referer),
+    host: domain.domain,
+    path: "/",
+    referer: optionalText(row.referer_host),
     country: optionalText(row.country),
     region: optionalText(row.region),
     city: optionalText(row.city),
@@ -839,10 +773,10 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
     operatingSystem: optionalText(row.operating_system),
     browser: optionalText(row.browser),
     deviceType: optionalText(row.device_type),
-    userAgent: optionalText(row.user_agent),
-    targetHost: text(row.target_host),
-    hideReferer: bool(row.hide_referer),
-    visitedAt: text(row.visited_at),
+    userAgent: null,
+    targetHost: domain.targetHost,
+    hideReferer: domain.hideReferer,
+    visitedAt: text(row.first_seen_at),
   }));
   return {
     ...domain,
@@ -1067,9 +1001,6 @@ export async function recordVisit(
   db: D1Database,
   input: {
     redirectDomainId: string;
-    host: string;
-    path: string;
-    referer: string | null;
     country: string | null;
     region: string | null;
     city: string | null;
@@ -1080,17 +1011,13 @@ export async function recordVisit(
     operatingSystem: string | null;
     browser: string | null;
     deviceType: string | null;
-    userAgent: string | null;
     refererHost: string | null;
-    targetHost: string;
-    hideReferer: boolean;
     visitorKey: string;
-    isBot: boolean;
   },
 ): Promise<void> {
   const day = today();
   const now = new Date().toISOString();
-  const unique = input.isBot ? null : await db
+  await db
     .prepare(
       `INSERT OR IGNORE INTO traffic_daily_visitors
        (subject_type, subject_id, day, visitor_key, first_seen_at, referer_host, country, region, city, latitude, longitude, timezone, language, operating_system, browser, device_type)
@@ -1098,61 +1025,6 @@ export async function recordVisit(
     )
     .bind(input.redirectDomainId, day, input.visitorKey, now, input.refererHost, input.country, input.region, input.city, input.latitude, input.longitude, input.timezone, input.language, input.operatingSystem, input.browser, input.deviceType)
     .run();
-  const visitIncrement = (unique?.meta.changes ?? 0) > 0 ? 1 : 0;
-  const statements = [
-    db
-      .prepare(
-        `INSERT INTO visit_events
-         (id, redirect_domain_id, host, path, referer, country, region, city, timezone, latitude, longitude, language, operating_system, browser, device_type, user_agent, target_host, hide_referer, visitor_key, is_bot, visited_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        crypto.randomUUID(),
-        input.redirectDomainId,
-        input.host,
-        input.path,
-        input.referer,
-        input.country,
-        input.region,
-        input.city,
-        input.timezone,
-        input.latitude,
-        input.longitude,
-        input.language,
-        input.operatingSystem,
-        input.browser,
-        input.deviceType,
-        input.userAgent,
-        input.targetHost,
-        input.hideReferer ? 1 : 0,
-        input.visitorKey,
-        input.isBot ? 1 : 0,
-        now,
-      ),
-    db
-      .prepare(
-        `INSERT INTO visit_daily_stats (redirect_domain_id, day, visits, unique_referers, last_accessed_at)
-         VALUES (?, ?, ?, 0, ?)
-         ON CONFLICT(redirect_domain_id, day) DO UPDATE SET
-           visits = visits + excluded.visits,
-           last_accessed_at = excluded.last_accessed_at`,
-      )
-      .bind(input.redirectDomainId, day, visitIncrement, now),
-    db
-      .prepare(
-        `INSERT INTO traffic_daily_stats (subject_type, subject_id, day, request_count, filtered_uv, last_accessed_at)
-         VALUES ('redirect_domain', ?, ?, 1, ?, ?)
-         ON CONFLICT(subject_type, subject_id, day) DO UPDATE SET
-           request_count = request_count + 1,
-           filtered_uv = (SELECT COUNT(*) FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND subject_id = excluded.subject_id AND day = excluded.day),
-           last_accessed_at = excluded.last_accessed_at`,
-      )
-      .bind(input.redirectDomainId, day, visitIncrement, now),
-    db
-      .prepare("UPDATE redirect_domains SET last_accessed_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
-      .bind(now, input.redirectDomainId),
-  ];
-  await db.batch(visitIncrement ? statements : statements.slice(1));
 }
 
 export async function summaryStats(db: D1Database): Promise<SummaryStats> {
@@ -1165,8 +1037,8 @@ export async function summaryStats(db: D1Database): Promise<SummaryStats> {
      FROM redirect_domains
      WHERE list_visible = 1`,
   );
-  const visits = await first(db, "SELECT COALESCE(SUM(filtered_uv), 0) AS visits FROM traffic_daily_stats WHERE subject_type = 'redirect_domain'");
-  const visitsToday = await first(db, "SELECT COALESCE(SUM(filtered_uv), 0) AS visits FROM traffic_daily_stats WHERE subject_type = 'redirect_domain' AND day = ?", today());
+  const visits = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain'");
+  const visitsToday = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND day = ?", today());
   return {
     totalDomains: numberValue(domainStats?.total ?? 0),
     activeDomains: numberValue(domainStats?.active ?? 0),
@@ -1325,5 +1197,9 @@ export async function recordJobFailure(
 }
 
 export async function cleanupVisits(db: D1Database, retentionDays: number): Promise<void> {
-  await db.prepare("DELETE FROM visit_events WHERE date(visited_at) < date(?)").bind(daysAgo(retentionDays)).run();
+  const cutoff = daysAgo(retentionDays);
+  await db.batch([
+    db.prepare("DELETE FROM visit_events WHERE date(visited_at) < date(?)").bind(cutoff),
+    db.prepare("DELETE FROM traffic_daily_visitors WHERE day < ?").bind(cutoff),
+  ]);
 }

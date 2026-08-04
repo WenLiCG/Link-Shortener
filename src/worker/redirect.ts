@@ -1,5 +1,5 @@
 import { findDomainByHost, recordVisit } from "./db";
-import { buildTargetUrl, noRefererHtml } from "./shared";
+import { buildTargetUrl, noRefererHtml, today } from "./shared";
 
 function firstLanguage(header: string | null): string | null {
   const value = header?.split(",")[0]?.split(";")[0]?.trim();
@@ -39,12 +39,8 @@ function clientFromUserAgent(userAgent: string | null): { operatingSystem: strin
 }
 
 function getClientIp(request: Request): string | null {
-  const direct = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-real-ip");
-  if (direct) {
-    return direct.trim();
-  }
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  return forwarded || null;
+  const ip = request.headers.get("cf-connecting-ipv6") ?? request.headers.get("cf-connecting-ip");
+  return ip?.trim() || null;
 }
 
 function refererHost(value: string | null): string | null {
@@ -58,26 +54,20 @@ function refererHost(value: string | null): string | null {
   }
 }
 
-async function sha256Hex(value: string): Promise<string> {
+async function hmacSha256Hex(secret: string, value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const digest = await crypto.subtle.sign("HMAC", key, bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function visitorKeyFromRequest(request: Request, env: Env, host: string): Promise<string> {
+export async function visitorKeyFromRequest(request: Request, env: Env, subject: string): Promise<string | null> {
   const ip = getClientIp(request);
-  const userAgent = request.headers.get("user-agent") ?? "";
-  const language = request.headers.get("accept-language") ?? "";
-  const cf = request.cf as Record<string, unknown> | undefined;
-  const fallback = [
-    "fallback",
-    host.toLowerCase(),
-    userAgent,
-    language,
-    typeof cf?.colo === "string" ? cf.colo : "",
-  ].join("|");
-  const source = ip ? `ip|${ip}` : fallback;
-  return sha256Hex(`${env.SESSION_SECRET ?? "link-shortener-visitor-v1"}|${source}`);
+  const secret = env.VISITOR_HASH_SECRET;
+  if (!ip || !secret) {
+    return null;
+  }
+  return hmacSha256Hex(secret, `${subject}|${today()}|${ip}`);
 }
 
 function isLikelyBotRequest(request: Request): boolean {
@@ -102,7 +92,7 @@ const IGNORED_PAGE_VIEW_PATHS = new Set([
 ]);
 
 export function shouldRecordPageView(request: Request): boolean {
-  if (request.method !== "GET" && request.method !== "HEAD") {
+  if (request.method !== "GET") {
     return false;
   }
   if (isLikelyBotRequest(request)) {
@@ -150,11 +140,13 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
       : buildTargetUrl(domain.targetHost);
   if (shouldRecordPageView(request)) {
     ctx.waitUntil(
-      (async () => recordVisit(env.DB, {
+      (async () => {
+        const visitorKey = await visitorKeyFromRequest(request, env, domain.id);
+        if (!visitorKey) {
+          return;
+        }
+        await recordVisit(env.DB, {
           redirectDomainId: domain.id,
-          host,
-          path: url.pathname,
-          referer: request.headers.get("referer"),
           country: request.cf?.country ? String(request.cf.country) : null,
           region: request.cf?.region ? String(request.cf.region) : null,
           city: request.cf?.city ? String(request.cf.city) : null,
@@ -165,13 +157,10 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
           operatingSystem: client.operatingSystem,
           browser: client.browser,
           deviceType: client.deviceType,
-          userAgent,
           refererHost: refererHost(request.headers.get("referer")),
-          targetHost: domain.redirectMode === "direct" ? domain.directTargetHost ?? domain.targetHost : domain.targetHost,
-          hideReferer: domain.hideReferer,
-          visitorKey: await visitorKeyFromRequest(request, env, host),
-          isBot: isLikelyBotRequest(request),
-        }))(),
+          visitorKey,
+        });
+      })(),
     );
   }
   if (domain.hideReferer) {

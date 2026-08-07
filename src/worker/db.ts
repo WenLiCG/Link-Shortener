@@ -527,10 +527,10 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
   }
   if (filters.days !== undefined) {
     if (filters.days === 0 || filters.days === -1) {
-      clauses.push("date(d.created_at) = date(?)");
+      clauses.push("date(d.created_at, '+8 hours') = date(?)");
       binds.push(daysAgo(-filters.days));
     } else if (filters.days > 0) {
-      clauses.push("date(d.created_at) >= date(?)");
+      clauses.push("date(d.created_at, '+8 hours') >= date(?)");
       binds.push(daysAgo(filters.days - 1));
     }
   }

@@ -22,15 +22,16 @@ beforeEach(async () => {
 describe("domain list date filters", () => {
   it("filters domains by today, yesterday, and seven calendar days", async () => {
     await insertDomain("today", today());
+    await insertDomain("cstToday", new Date(`${today()}T00:30:00+08:00`).toISOString());
     await insertDomain("yesterday", daysAgo(1));
     await insertDomain("week", daysAgo(6));
     await insertDomain("old", daysAgo(7));
     await insertDomain("thirtyDays", daysAgo(29));
     await insertDomain("thirtyOneDays", daysAgo(30));
 
-    await expectDomains({ days: 0 }, ["today"]);
+    await expectDomains({ days: 0 }, ["today", "cstToday"]);
     await expectDomains({ days: -1 }, ["yesterday"]);
-    await expectDomains({ days: 7 }, ["today", "yesterday", "week"]);
-    await expectDomains({ days: 30 }, ["today", "yesterday", "week", "old", "thirtyDays"]);
+    await expectDomains({ days: 7 }, ["today", "cstToday", "yesterday", "week"]);
+    await expectDomains({ days: 30 }, ["today", "cstToday", "yesterday", "week", "old", "thirtyDays"]);
   });
 });

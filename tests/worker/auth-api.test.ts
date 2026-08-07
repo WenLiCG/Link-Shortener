@@ -1,5 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { handleApi } from "../../src/worker/api";
 import { hashPasswordForDocs } from "../../src/worker/auth";
 
 const password = "correct horse battery staple";
@@ -93,6 +94,34 @@ describe("authenticated mutations", () => {
 });
 
 describe("session lifecycle", () => {
+  it("reports visitor hash readiness without revealing the secret", async () => {
+    const cookie = await login();
+    const response = await SELF.fetch("https://admin.example.com/api/settings/check", {
+      headers: { cookie },
+    });
+    const body = await response.json<{ data: { hasVisitorHashSecret?: boolean } }>();
+
+    expect(body.data.hasVisitorHashSecret).toBe(true);
+    expect(JSON.stringify(body)).not.toContain(testEnv.VISITOR_HASH_SECRET);
+  });
+
+  it("does not accept a visitor hash secret shorter than 32 bytes", async () => {
+    const cookie = await login();
+    const response = await handleApi(
+      new Request("https://admin.example.com/api/settings/check", { headers: { cookie } }),
+      {
+        DB: env.DB,
+        ADMIN_HOST: "admin.example.com",
+        SESSION_SECRET: testEnv.SESSION_SECRET,
+        VISITOR_HASH_SECRET: "too-short",
+      } as unknown as Env,
+      {} as ExecutionContext,
+    );
+    const body = await response.json<{ data: { hasVisitorHashSecret: boolean } }>();
+
+    expect(body.data.hasVisitorHashSecret).toBe(false);
+  });
+
   it("invalidates an existing session after the password hash changes", async () => {
     const cookie = await login();
     const nextHash = await hashPasswordForDocs("replacement password", testEnv.PASSWORD_PEPPER);

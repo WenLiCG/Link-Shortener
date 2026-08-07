@@ -379,11 +379,13 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 
   if (pathname === "/api/settings/check") {
     assertMethod(request, "GET");
+    const visitorHashSecret = secret(env, "VISITOR_HASH_SECRET");
     return ok({
       adminHost: env.ADMIN_HOST || null,
       workerScriptName: env.WORKER_SCRIPT_NAME || "link-shortener-manager",
       hasAdminPasswordHash: await hasConfiguredValue(env, "ADMIN_PASSWORD_HASH"),
       hasSessionSecret: Boolean(secret(env, "SESSION_SECRET")),
+      hasVisitorHashSecret: Boolean(visitorHashSecret && new TextEncoder().encode(visitorHashSecret).byteLength >= 32),
       hasPasswordPepper: Boolean(secret(env, "PASSWORD_PEPPER")),
       hasCloudflareAccountId: Boolean(secret(env, "CLOUDFLARE_ACCOUNT_ID")),
       hasCloudflareApiToken: Boolean(secret(env, "CLOUDFLARE_API_TOKEN")),

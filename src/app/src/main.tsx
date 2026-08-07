@@ -157,6 +157,7 @@ interface SettingsCheck {
   workerScriptName: string;
   hasAdminPasswordHash: boolean;
   hasSessionSecret: boolean;
+  hasVisitorHashSecret: boolean;
   hasPasswordPepper: boolean;
   hasCloudflareAccountId: boolean;
   hasCloudflareApiToken: boolean;
@@ -2524,6 +2525,7 @@ function SettingsView({ settings, onUpdated, onLogout }: { settings: SettingsChe
       ["后台 Host", Boolean(settings.adminHost), settings.adminHost ?? "未配置"],
       ["后台密码 Hash", settings.hasAdminPasswordHash, "ADMIN_PASSWORD_HASH"],
       ["Session Secret", settings.hasSessionSecret, "SESSION_SECRET"],
+      ["访问者 Hash Secret", settings.hasVisitorHashSecret, "VISITOR_HASH_SECRET（至少 32 字节）"],
       ["Password Pepper", settings.hasPasswordPepper, "PASSWORD_PEPPER"],
       ["Cloudflare Account", settings.hasCloudflareAccountId, "CLOUDFLARE_ACCOUNT_ID"],
       ["Cloudflare Token", settings.hasCloudflareApiToken, "CLOUDFLARE_API_TOKEN"],

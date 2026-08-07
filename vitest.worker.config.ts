@@ -17,7 +17,7 @@ export default defineConfig({
           PASSWORD_PEPPER: "test-password-pepper",
           CLOUDFLARE_ACCOUNT_ID: "test-account",
           CLOUDFLARE_API_TOKEN: "test-cloudflare-token",
-          VISITOR_HASH_SECRET: "test-visitor-secret",
+          VISITOR_HASH_SECRET: "0123456789abcdef0123456789abcdef",
           VERIFICATION_SIGNING_SECRET: "test-verification-secret",
           TURNSTILE_SITE_KEY: "1x00000000000000000000BB",
           TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",

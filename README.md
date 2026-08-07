@@ -17,10 +17,11 @@ A Cloudflare-native redirect management app for operating many entry domains fro
 
 ## Security Notice
 
-Do not commit secrets. Keep provider credentials only in Cloudflare Worker Secrets or local `.dev.vars`:
+Do not commit secrets. Keep them only in Cloudflare Worker Secrets or local `.dev.vars`:
 
 - `ADMIN_PASSWORD_HASH`
 - `SESSION_SECRET`
+- `VISITOR_HASH_SECRET`
 - `PASSWORD_PEPPER`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_API_TOKEN`
@@ -107,13 +108,16 @@ Set production secrets with Wrangler:
 ```bash
 npx wrangler secret put ADMIN_PASSWORD_HASH
 npx wrangler secret put SESSION_SECRET
+npx wrangler secret put VISITOR_HASH_SECRET
 npx wrangler secret put PASSWORD_PEPPER
 npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
 npx wrangler secret put CLOUDFLARE_API_TOKEN
 npx wrangler secret put DYNADOT_API_KEY
 ```
 
-`DYNADOT_API_KEY` is optional if you only want manual nameserver instructions. Provider credentials cannot be edited in the admin UI and are never stored in D1.
+`VISITOR_HASH_SECRET` is required for visit accounting. Generate at least 32 random bytes (for example, `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`) and paste that generated value into `npx wrangler secret put VISITOR_HASH_SECRET`. The initialization check reports only whether the secret is present and long enough; it never returns the value.
+
+`DYNADOT_API_KEY` is optional if you only want manual nameserver instructions. Secrets cannot be edited in the admin UI and are never stored in D1.
 
 ## D1 Migrations
 
@@ -123,13 +127,30 @@ Apply migrations locally:
 npx wrangler d1 migrations apply multi-domain-redirect-manager --local
 ```
 
-For an existing deployment, first create the ignored deployment-only `.wrangler/deploy.jsonc` with the real D1 database ID, `ADMIN_HOST`, and custom-domain route. Configure all production secrets above, back up D1, deploy the updated Worker, then apply remote migrations:
+For an existing deployment, first create the ignored deployment-only `.wrangler/deploy.jsonc` with the real D1 database ID, `ADMIN_HOST`, and custom-domain route. Configure the production secrets above, then build and dry-run the exact artifact you will deploy.
+
+An existing deployment requires a coordinated maintenance window. Migration `0018` rebuilds the job queue: the old Worker cannot write its new required columns, while the current Worker cannot use the old queue schema. Do not use a live “deploy then migrate” or “migrate then deploy” sequence.
+
+1. Record the active Worker version (`npx wrangler versions list --config .wrangler/deploy.jsonc`). Export D1 and record a Time Travel bookmark immediately before the window:
 
 ```bash
-npx wrangler d1 migrations apply multi-domain-redirect-manager --remote
+npx wrangler d1 export multi-domain-redirect-manager --remote --config .wrangler/deploy.jsonc --output <backup.sql>
+npx wrangler d1 time-travel info multi-domain-redirect-manager --config .wrangler/deploy.jsonc --timestamp <current-UTC-RFC3339>
 ```
 
-Migration `0017` removes legacy provider credentials from D1, so applying it before the Worker reads Wrangler Secrets can interrupt automation. Migration `0019` adds the daily visitor facts table; it is additive and does not retain raw IP addresses.
+2. Start the maintenance window: stop public traffic to this Worker (for example with the existing Cloudflare maintenance rule or by temporarily disabling its public routes) and pause its cron trigger. Confirm no redirect, admin, or scheduled request can reach the Worker while schemas are mixed.
+3. Apply all remote migrations, then immediately deploy the already validated Worker:
+
+```bash
+npx wrangler d1 migrations apply multi-domain-redirect-manager --remote --config .wrangler/deploy.jsonc
+npm run deploy -- --config .wrangler/deploy.jsonc
+```
+
+4. While traffic is still paused, open the initialization check, confirm every required item (including `VISITOR_HASH_SECRET`) passes, and smoke-test one redirect. Re-enable routes and the cron only after both checks pass.
+
+If migration or deployment verification fails, keep traffic paused, run `npx wrangler rollback <previous-version-id> --config .wrangler/deploy.jsonc`, restore D1 to the saved pre-window bookmark with `npx wrangler d1 time-travel restore multi-domain-redirect-manager --config .wrangler/deploy.jsonc --bookmark <bookmark>`, verify the old Worker against the restored schema, then reopen traffic. The SQL export is the additional offline backup; do not import it over a partially migrated database.
+
+Migration `0017` removes legacy provider credentials from D1, so its Wrangler Secrets must exist before the window. Migration `0019` adds the daily visitor facts table without raw IP addresses; migration `0021` corrects its historical rows to Shanghai calendar days and restores the cleanup index.
 
 ## Cloudflare API Token Permissions
 

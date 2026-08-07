@@ -837,7 +837,7 @@ function App() {
       if (filters.search) params.set("search", filters.search);
       if (filters.groupId) params.set("groupId", filters.groupId);
       if (filters.status) params.set("status", filters.status);
-      if (filters.days) params.set("days", filters.days === "today" ? "1" : filters.days);
+      if (filters.days) params.set("days", filters.days);
       const [domainData, targetData, shortLinkData, groupData, summaryData, settingsData, registrarData] = await Promise.all([
         api<RedirectDomain[]>(`/api/domains?${params.toString()}`),
         api<TargetService[]>("/api/targets"),
@@ -1106,7 +1106,9 @@ function DomainsView({
         </select>
         <select value={filters.days} onChange={(event) => setFilters((current) => ({ ...current, days: event.target.value }))}>
           <option value="">全部时间</option>
-          <option value="1">今天</option>
+          <option value="0">今天</option>
+          <option value="-1">昨天</option>
+          <option value="7">过去 7 天</option>
           <option value="30">过去一个月</option>
           <option value="90">过去三个月</option>
           <option value="180">过去半年</option>

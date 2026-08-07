@@ -525,9 +525,14 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
     clauses.push("d.status = ?");
     binds.push(filters.status);
   }
-  if (filters.days) {
-    clauses.push("date(d.created_at) >= date(?)");
-    binds.push(daysAgo(filters.days));
+  if (filters.days !== undefined) {
+    if (filters.days === 0 || filters.days === -1) {
+      clauses.push("date(d.created_at) = date(?)");
+      binds.push(daysAgo(-filters.days));
+    } else if (filters.days > 0) {
+      clauses.push("date(d.created_at) >= date(?)");
+      binds.push(daysAgo(filters.days - 1));
+    }
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   return (

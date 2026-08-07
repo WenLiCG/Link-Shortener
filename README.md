@@ -131,7 +131,7 @@ For an existing deployment, first create the ignored deployment-only `.wrangler/
 
 An existing deployment requires a coordinated maintenance window. Migration `0018` rebuilds the job queue: the old Worker cannot write its new required columns, while the current Worker cannot use the old queue schema. Do not use a live “deploy then migrate” or “migrate then deploy” sequence.
 
-1. Record the active Worker version (`npx wrangler versions list --config .wrangler/deploy.jsonc`). Export D1 and record a Time Travel bookmark immediately before the window:
+1. Identify the active Worker deployment and record its version ID (`npx wrangler deployments list --config .wrangler/deploy.jsonc`). Export D1 and record a Time Travel bookmark immediately before the window:
 
 ```bash
 npx wrangler d1 export multi-domain-redirect-manager --remote --config .wrangler/deploy.jsonc --output <backup.sql>

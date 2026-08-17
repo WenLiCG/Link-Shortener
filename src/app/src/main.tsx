@@ -1688,7 +1688,8 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
   const [repairingIds, setRepairingIds] = useState<string[]>([]);
   const [deletingIds, setDeletingIds] = useState<string[]>([]);
   const [actionError, setActionError] = useState("");
-  const [manualTarget, setManualTarget] = useState<TargetService | null>(null);
+  const [manualTargetId, setManualTargetId] = useState<string | null>(null);
+  const manualTarget = targets.find((target) => target.id === manualTargetId) ?? null;
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -1817,7 +1818,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
                     {target.targetHost}
                     <ExternalLink size={14} />
                   </a>
-                  <button className="icon" title="配置说明" onClick={() => setManualTarget(target)}>
+                  <button className="icon" title="配置说明" onClick={() => setManualTargetId(target.id)}>
                     <Info size={16} />
                   </button>
                   <button className="icon" title="重新配置" disabled={repairingIds.includes(target.id)} onClick={() => void repairTarget(target)}>
@@ -1840,7 +1841,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
           </div>
         )}
       </div>
-      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTarget(null)} onUpdated={onCreated} />}
+      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTargetId(null)} onUpdated={onCreated} />}
     </section>
   );
 }
@@ -1851,6 +1852,30 @@ function ManualConfigModal({ target, onClose, onUpdated }: { target: TargetServi
   ) as Record<TargetConfigurationItem, TargetConfigurationResult>);
   const [pendingItems, setPendingItems] = useState<TargetConfigurationItem[]>([]);
 
+  useEffect(() => {
+    let active = true;
+    setPendingItems([...targetConfigurationItems]);
+    void api<{ configuration: TargetConfigurationResult[] }>(`/api/targets/${target.id}/check`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }).then(async ({ configuration }) => {
+      if (!active) return;
+      setResults(Object.fromEntries(configuration.map((item) => [item.item, item])) as Record<TargetConfigurationItem, TargetConfigurationResult>);
+      await onUpdated();
+    }).catch((error) => {
+      if (!active) return;
+      const message = error instanceof Error ? error.message : "暂时无法读取配置，请使用各项的信息检查按钮重试。";
+      setResults((current) => Object.fromEntries(targetConfigurationItems.map((item) => [item, {
+        ...current[item],
+        status: "unknown",
+        summary: message,
+      }])) as Record<TargetConfigurationItem, TargetConfigurationResult>);
+    }).finally(() => {
+      if (active) setPendingItems([]);
+    });
+    return () => { active = false; };
+  }, [target.id]);
+
   async function runItem(item: TargetConfigurationItem, action: "check" | "configure") {
     setPendingItems((current) => [...new Set([...current, item])]);
     try {
@@ -1859,9 +1884,7 @@ function ManualConfigModal({ target, onClose, onUpdated }: { target: TargetServi
         body: JSON.stringify({}),
       });
       setResults((current) => ({ ...current, [item]: next }));
-      if (action === "configure") {
-        await onUpdated();
-      }
+      await onUpdated();
     } catch (error) {
       const message = error instanceof Error ? error.message : "操作失败，请按本项说明手动完成。";
       setResults((current) => ({

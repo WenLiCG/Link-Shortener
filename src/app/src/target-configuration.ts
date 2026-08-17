@@ -17,6 +17,7 @@ interface TargetConfigurationSource {
   cloudflareNameservers: string[];
   nameserverStatus: string;
   dnsStatus: string;
+  automationStatus: string;
 }
 
 function recordName(target: TargetConfigurationSource): string {
@@ -57,6 +58,9 @@ export function initialConfigurationResult(
   if (item === "dns") {
     if (target.dnsStatus === "configured") return result(item, "passed", "已记录 DNS 由当前 Worker 接管。", ["如需确认当前记录，点击信息检查。"], details);
     return result(item, target.dnsStatus === "failed" ? "failed" : "unknown", "尚未实时确认 DNS 记录。", ["点击信息检查读取 A、AAAA 和 CNAME 记录。"], details);
+  }
+  if (target.automationStatus === "route_configured") {
+    return result(item, "passed", "已记录 Worker Route 配置成功，正在进行实时确认。", ["点击信息检查可重新读取当前 Route。"], details);
   }
   return result(item, "unknown", "尚未实时确认 Worker Route。", ["点击信息检查读取当前 Route 及绑定的 Worker。"], details);
 }

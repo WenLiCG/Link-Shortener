@@ -137,6 +137,10 @@ export async function checkTargetConfigurationItem(
   }
 }
 
+export async function checkTargetConfiguration(env: Env, targetId: string): Promise<TargetConfigurationResult[]> {
+  return Promise.all(targetConfigurationItems.map((item) => checkTargetConfigurationItem(env, targetId, item)));
+}
+
 export async function configureTargetConfigurationItem(
   env: Env,
   targetId: string,
@@ -173,7 +177,13 @@ export async function configureTargetConfigurationItem(
   }
   if (item === "route") {
     await ensureWorkerRouteForHost(env, zone.id, target.targetHost);
-    await updateTargetAutomation(env.DB, target.id, { automationStatus: "route_configured", lastError: null });
   }
-  return checkTargetConfigurationItem(env, targetId, item);
+  const checked = await checkTargetConfigurationItem(env, targetId, item);
+  if (item === "route") {
+    await updateTargetAutomation(env.DB, target.id, {
+      automationStatus: checked.status === "passed" ? "route_configured" : "route_failed",
+      lastError: checked.status === "failed" ? checked.summary : null,
+    });
+  }
+  return checked;
 }

@@ -71,7 +71,7 @@ export async function repairTargetService(env: Env, targetId: string): Promise<v
     const latestZone = await getZone(env, zone.id);
     const nameserverStatus = latestZone.status === "active" ? "active" : "waiting";
     await updateTargetAutomation(env.DB, target.id, {
-      automationStatus: "dns_configured",
+      automationStatus: "route_configured",
       dnsStatus: "configured",
       cloudflareZoneName: latestZone.name,
       cloudflareZoneStatus: latestZone.status,

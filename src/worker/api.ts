@@ -492,9 +492,11 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       throw new HttpError(404, "not_found", "目标服务不存在。");
     }
     const item = rawItem as TargetConfigurationItem;
-    return ok(action === "check"
+    const configuration = action === "check"
       ? await checkTargetConfigurationItem(env, targetId, item)
-      : await configureTargetConfigurationItem(env, targetId, item));
+      : await configureTargetConfigurationItem(env, targetId, item);
+    const health = await refreshTargetHealth(env, targetId);
+    return ok({ ...configuration, targetHealthStatus: health?.status ?? "failed" });
   }
 
   const targetForwardMatch = pathname.match(/^\/api\/targets\/([^/]+)\/forward$/);
@@ -566,9 +568,14 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (!target) {
       throw new HttpError(404, "not_found", "目标服务不存在。");
     }
-    await markTargetHealthChecking(env.DB, target.id);
-    ctx.waitUntil(refreshTargetHealth(env, target.id));
-    return ok({ id: target.id, healthStatus: "checking" });
+    const refreshed = await refreshTargetHealth(env, target.id);
+    return ok({
+      id: target.id,
+      healthStatus: refreshed?.status ?? "failed",
+      healthHttpStatus: refreshed?.httpStatus ?? null,
+      healthError: refreshed?.error ?? "configuration_check_failed",
+      configuration: refreshed?.configuration ?? [],
+    });
   }
 
   const targetRepairMatch = pathname.match(/^\/api\/targets\/([^/]+)\/repair$/);

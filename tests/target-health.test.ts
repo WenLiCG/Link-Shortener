@@ -9,6 +9,15 @@ vi.mock("../src/worker/db", () => ({
   updateTargetHealth: vi.fn(),
 }));
 
+vi.mock("../src/worker/target-configuration", () => ({
+  checkTargetConfiguration: vi.fn().mockResolvedValue([
+    { item: "zone", status: "passed", summary: "Zone 已通过。", manualSteps: [], details: {} },
+    { item: "nameserver", status: "passed", summary: "Nameserver 已通过。", manualSteps: [], details: {} },
+    { item: "dns", status: "passed", summary: "DNS 已通过。", manualSteps: [], details: {} },
+    { item: "route", status: "passed", summary: "Route 已通过。", manualSteps: [], details: {} },
+  ]),
+}));
+
 describe("target health", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -65,7 +74,7 @@ describe("target health", () => {
     );
   });
 
-  it("does not trust stored automation state instead of a real request", async () => {
+  it("uses the four live configuration checks instead of an unsupported same-zone fetch", async () => {
     vi.mocked(getTargetById).mockResolvedValue({
       id: "target-1",
       targetHost: "example.com",
@@ -77,13 +86,14 @@ describe("target health", () => {
     vi.mocked(updateTargetHealth).mockResolvedValue();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 530 }));
 
-    await refreshTargetHealth({ DB: {} as D1Database } as Env, "target-1");
+    const refreshed = await refreshTargetHealth({ DB: {} as D1Database } as Env, "target-1");
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(refreshed).toMatchObject({ status: "ok", httpStatus: null, error: null });
     expect(updateTargetHealth).toHaveBeenCalledWith(
       expect.anything(),
       "target-1",
-      expect.objectContaining({ status: "failed", httpStatus: 530 }),
+      expect.objectContaining({ status: "ok", httpStatus: null, error: null }),
     );
   });
 });

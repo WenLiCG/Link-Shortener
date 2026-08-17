@@ -1,5 +1,6 @@
 import { getTargetById, listStaleTargetIds, markTargetHealthChecking, updateTargetHealth } from "./db";
 import { buildTargetUrl } from "./shared";
+import { checkTargetConfiguration, type TargetConfigurationResult } from "./target-configuration";
 
 export interface TargetHealthResult {
   status: "ok" | "failed";
@@ -48,14 +49,36 @@ export async function checkTargetHealth(targetHost: string): Promise<TargetHealt
   }
 }
 
-export async function refreshTargetHealth(env: Env, targetId: string): Promise<void> {
+export interface TargetHealthRefreshResult extends TargetHealthResult {
+  configuration: TargetConfigurationResult[];
+}
+
+export async function refreshTargetHealth(env: Env, targetId: string): Promise<TargetHealthRefreshResult | null> {
   const target = await getTargetById(env.DB, targetId);
   if (!target) {
-    return;
+    return null;
   }
   await markTargetHealthChecking(env.DB, target.id);
-  const result = await checkTargetHealth(target.targetHost);
+  let result: TargetHealthRefreshResult;
+  try {
+    const configuration = await checkTargetConfiguration(env, target.id);
+    const failed = configuration.find((item) => item.status !== "passed");
+    result = {
+      status: failed ? "failed" : "ok",
+      httpStatus: null,
+      error: failed?.summary ?? null,
+      configuration,
+    };
+  } catch {
+    result = {
+      status: "failed",
+      httpStatus: null,
+      error: "configuration_check_failed",
+      configuration: [],
+    };
+  }
   await updateTargetHealth(env.DB, target.id, result);
+  return result;
 }
 
 export async function refreshStaleTargetHealth(env: Env, limit = 10): Promise<void> {

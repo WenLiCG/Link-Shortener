@@ -9,13 +9,14 @@ function target(overrides: Record<string, unknown> = {}) {
     cloudflareNameservers: ["agustin.ns.cloudflare.com", "linda.ns.cloudflare.com"],
     nameserverStatus: "active",
     dnsStatus: "configured",
+    automationStatus: "route_configured",
     ...overrides,
   };
 }
 
 describe("target configuration UI state", () => {
-  it("keeps an unverified Worker Route unknown even when DNS is configured", () => {
-    expect(initialConfigurationResult(target(), "route")).toMatchObject({ status: "unknown" });
+  it("keeps a verified Worker Route green after the configuration dialog is reopened", () => {
+    expect(initialConfigurationResult(target(), "route")).toMatchObject({ status: "passed" });
   });
 
   it("shows an active inherited Nameserver as passed", () => {

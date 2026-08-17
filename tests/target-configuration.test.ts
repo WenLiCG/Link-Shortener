@@ -105,4 +105,20 @@ describe("target configuration", () => {
     expect(ensureWorkerRouteForHost).not.toHaveBeenCalled();
     expect(setNameservers).not.toHaveBeenCalled();
   });
+
+  it("does not persist a successful Worker Route state when verification fails", async () => {
+    vi.mocked(getTargetById).mockResolvedValue(target());
+    vi.mocked(findBestZoneForHost).mockResolvedValue(zone());
+    vi.mocked(findWorkerRouteForHost).mockResolvedValue(null);
+    vi.mocked(ensureWorkerRouteForHost).mockResolvedValue();
+    vi.mocked(updateTargetAutomation).mockResolvedValue();
+
+    await expect(configureTargetConfigurationItem(env, "target-1", "route")).resolves.toMatchObject({
+      item: "route",
+      status: "failed",
+    });
+    expect(updateTargetAutomation).toHaveBeenLastCalledWith(env.DB, "target-1", expect.objectContaining({
+      automationStatus: "route_failed",
+    }));
+  });
 });

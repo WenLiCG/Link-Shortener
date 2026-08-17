@@ -28,7 +28,6 @@
 - Modify: `src/app/src/main.tsx` — 配置说明的逐项行与按钮。
 - Modify: `src/app/src/styles.css` — 逐项行和小屏样式。
 - Modify: `wrangler.jsonc` — 公网 fetch 兼容性标志。
-- Create: `tests/wrangler-config.test.ts` — 标志回归测试。
 
 ### Task 1: 建立 Cloudflare 读取能力和配置项服务
 
@@ -293,7 +292,6 @@ git commit -m "feat: show per-item target configuration guidance"
 **Files:**
 
 - Modify: `wrangler.jsonc:5`
-- Create: `tests/wrangler-config.test.ts`
 - Test: `tests/target-health.test.ts`
 
 **Interfaces:**
@@ -301,49 +299,34 @@ git commit -m "feat: show per-item target configuration guidance"
 - Consumes: `wrangler.jsonc` compatibility flags and `checkTargetHealth()`.
 - Produces: health `fetch()` calls that enter Cloudflare’s public routing layer.
 
-- [ ] **Step 1: Write the failing Wrangler configuration test**
-
-```ts
-it("enables strictly public fetch routing for target health checks", async () => {
-  const config = await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8");
-  expect(config).toContain('"global_fetch_strictly_public"');
-});
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `npm run test:node -- tests/wrangler-config.test.ts`
-
-Expected: FAIL because the flag is absent.
-
-- [ ] **Step 3: Add the compatibility flag**
+- [ ] **Step 1: Add the compatibility flag**
 
 ```jsonc
 "compatibility_flags": ["nodejs_compat_v2", "global_fetch_strictly_public"],
 ```
 
-- [ ] **Step 4: Run focused checks**
+- [ ] **Step 2: Run focused checks**
 
-Run: `npm run test:node -- tests/wrangler-config.test.ts tests/target-health.test.ts && npm run wrangler:check`
+Run: `npm run test:node -- tests/target-health.test.ts && npm run wrangler:check`
 
 Expected: PASS and Wrangler dry-run exits 0.
 
-- [ ] **Step 5: Run full verification**
+- [ ] **Step 3: Run full verification**
 
 Run: `npm run test:all && npm run build && npm run wrangler:check`
 
 Expected: all Node and Worker Vitest tests pass, build exits 0, dry-run exits 0.
 
-- [ ] **Step 6: Confirm the reported domain publicly**
+- [ ] **Step 4: Confirm the reported domain publicly**
 
 Run: `curl.exe -sS -o NUL -w "%{http_code}" -X HEAD --max-time 15 https://s.g60.net/` and `curl.exe -sS -o NUL -w "%{http_code}" --max-time 15 https://s.g60.net/`
 
 Expected: `204` for HEAD and `200` for GET.
 
-- [ ] **Step 7: Commit configuration and tests**
+- [ ] **Step 5: Commit configuration**
 
 ```bash
-git add wrangler.jsonc tests/wrangler-config.test.ts
+git add wrangler.jsonc
 git commit -m "fix: route target health checks through Cloudflare"
 ```
 

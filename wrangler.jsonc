@@ -3,7 +3,7 @@
   "name": "multi-domain-redirect-manager",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-06-14",
-  "compatibility_flags": ["nodejs_compat_v2"],
+  "compatibility_flags": ["nodejs_compat_v2", "global_fetch_strictly_public"],
   "workers_dev": true,
   // For production on a custom admin domain, uncomment and replace this route.
   // "routes": [

@@ -22,7 +22,7 @@ vi.mock("../src/worker/dynadot", () => ({
   setNameservers: vi.fn(),
 }));
 
-const env = { WORKER_SCRIPT_NAME: "multi-domain-redirect-manager" } as Env;
+const env = { WORKER_SCRIPT_NAME: "multi-domain-redirect-manager" } as unknown as Env;
 
 function target(overrides: Record<string, unknown> = {}) {
   return {

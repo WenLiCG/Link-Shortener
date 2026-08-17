@@ -29,6 +29,12 @@ import {
 } from "lucide-react";
 import { runSerialBatch } from "./batch";
 import { useOperationPolling } from "./hooks/useOperationPolling";
+import {
+  initialConfigurationResult,
+  targetConfigurationItems,
+  type TargetConfigurationItem,
+  type TargetConfigurationResult,
+} from "./target-configuration";
 import "./styles.css";
 
 type ApiBody<T> = { ok: true; data: T } | { ok: false; error: { code: string; message: string } };
@@ -1834,30 +1840,38 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
           </div>
         )}
       </div>
-      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTarget(null)} />}
+      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTarget(null)} onUpdated={onCreated} />}
     </section>
   );
 }
 
-function dnsRecordName(target: TargetService): string {
-  const zone = target.cloudflareZoneName;
-  if (!zone) {
-    return target.targetHost;
-  }
-  if (target.targetHost === zone) {
-    return "@";
-  }
-  if (target.targetHost.endsWith(`.${zone}`)) {
-    return target.targetHost.slice(0, -(zone.length + 1));
-  }
-  return target.targetHost;
-}
+function ManualConfigModal({ target, onClose, onUpdated }: { target: TargetService; onClose: () => void; onUpdated: () => Promise<void> }) {
+  const [results, setResults] = useState<Record<TargetConfigurationItem, TargetConfigurationResult>>(() => Object.fromEntries(
+    targetConfigurationItems.map((item) => [item, initialConfigurationResult(target, item)]),
+  ) as Record<TargetConfigurationItem, TargetConfigurationResult>);
+  const [pendingItems, setPendingItems] = useState<TargetConfigurationItem[]>([]);
 
-function ManualConfigModal({ target, onClose }: { target: TargetService; onClose: () => void }) {
-  const recordName = dnsRecordName(target);
-  const zoneName = target.cloudflareZoneName ?? "尚未识别，请先点击重新配置";
-  const needsNs = target.nameserverStatus !== "active" && target.cloudflareNameservers.length > 0;
-  const nsText = target.cloudflareNameservers.length > 0 ? target.cloudflareNameservers.join("\n") : "点击重新配置后显示 Cloudflare Nameserver";
+  async function runItem(item: TargetConfigurationItem, action: "check" | "configure") {
+    setPendingItems((current) => [...new Set([...current, item])]);
+    try {
+      const next = await api<TargetConfigurationResult>(`/api/targets/${target.id}/configuration/${item}/${action}`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setResults((current) => ({ ...current, [item]: next }));
+      if (action === "configure") {
+        await onUpdated();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "操作失败，请按本项说明手动完成。";
+      setResults((current) => ({
+        ...current,
+        [item]: { ...current[item], status: "failed", summary: message },
+      }));
+    } finally {
+      setPendingItems((current) => current.filter((currentItem) => currentItem !== item));
+    }
+  }
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
@@ -1869,60 +1883,54 @@ function ManualConfigModal({ target, onClose }: { target: TargetService; onClose
           </div>
           <button className="icon" title="关闭" onClick={onClose}><X size={18} /></button>
         </header>
-
-        <div className="config-grid">
-          <div className="config-card">
-            <strong>当前状态</strong>
-            <div className="mini-status">
-              <Badge status={target.healthStatus} />
-              <Badge status={target.nameserverStatus} />
-              <Badge status={target.dnsStatus} />
-            </div>
-            <small>{target.lastError ?? target.healthError ?? "未发现明确错误。"}</small>
+        <div className="config-overview">
+          <strong>公网服务状态</strong>
+          <div className="mini-status">
+            <Badge status={target.healthStatus} />
+            <Badge status={target.nameserverStatus} />
+            <Badge status={target.dnsStatus} />
           </div>
-          <div className="config-card">
-            <strong>Cloudflare Zone</strong>
-            <span>{zoneName}</span>
-            <small>如果 Zone 未识别，先点击本行的“重新配置”。</small>
-          </div>
+          <small>{target.lastError ?? target.healthError ?? "逐项检查可确认当前 Cloudflare 配置。"}</small>
         </div>
 
-        {needsNs && (
-          <div className="config-section">
-            <h3>1. 在注册商更新 Nameserver</h3>
-            <p>如果这个目标服务域名是根域名，并且当前 NS 还不是 Cloudflare，请到注册商把 Nameserver 改成下面这些值。</p>
-            <pre>{nsText}</pre>
-          </div>
-        )}
-
-        <div className="config-section">
-          <h3>{needsNs ? "2" : "1"}. 接入当前 Worker</h3>
-          <p>如果这个目标服务由本系统承接，点击本行“重新配置”即可自动写入下面这类 DNS 记录，并创建 Worker Route。</p>
-          <div className="record-table">
-            <span>Zone</span><strong>{zoneName}</strong>
-            <span>Name</span><strong>{recordName}</strong>
-            <span>Type</span><strong>A</strong>
-            <span>Content</span><strong>192.0.2.1</strong>
-            <span>Proxy</span><strong>开启橙云</strong>
-            <span>Worker Route</span><strong>{target.targetHost}/*</strong>
-          </div>
-        </div>
-
-        <div className="config-section">
-          <h3>{needsNs ? "3" : "2"}. 自动失败时手动配置</h3>
-          <p>如果 Cloudflare Token 权限不足、API 临时失败，或你想手动确认配置，请按下面步骤操作。</p>
-          <ol className="config-steps">
-            <li>打开 Cloudflare Dashboard，进入 <strong>{zoneName}</strong> 的 DNS 页面。</li>
-            <li>删除同名的 A、AAAA 或 CNAME 记录，避免和本系统接管记录冲突。</li>
-            <li>新增 A 记录：Name 填 <strong>{recordName}</strong>，Content 填 <strong>192.0.2.1</strong>，Proxy 开启橙云。</li>
-            <li>进入 Workers Routes，为 <strong>{target.targetHost}/*</strong> 绑定 Worker <strong>link-shortener-manager</strong>。</li>
-            <li>回到本页面点击“重新检测”。</li>
-          </ol>
-        </div>
-
-        <div className="config-section">
-          <h3>{needsNs ? "4" : "3"}. 保存后验证</h3>
-          <p>重新配置完成后，再点“重新检测”检查 HTTPS 根地址。由本系统承接的目标服务会返回 200 或 204；如果仍是 404，通常说明请求没有进入当前 Worker。</p>
+        <div className="config-check-list">
+          {targetConfigurationItems.map((item) => {
+            const config = results[item];
+            const pending = pendingItems.includes(item);
+            const labels: Record<TargetConfigurationItem, string> = {
+              zone: "Cloudflare Zone",
+              nameserver: "Nameserver",
+              dns: "DNS 记录",
+              route: "Worker Route",
+            };
+            const icon = config.status === "passed"
+              ? <CheckCircle2 size={18} />
+              : config.status === "failed"
+                ? <X size={18} />
+                : <CircleDot size={18} />;
+            return (
+              <section key={item} className={`config-check-row ${config.status}`}>
+                <div className="config-check-icon">{icon}</div>
+                <div className="config-check-copy">
+                  <strong>{labels[item]}</strong>
+                  <small>{config.summary}</small>
+                </div>
+                <div className="config-check-actions">
+                  <button type="button" disabled={pending} onClick={() => void runItem(item, "configure")}>
+                    {pending ? <Loader2 className="spin" size={15} /> : <Settings size={15} />}
+                    再次配置
+                  </button>
+                  <button type="button" disabled={pending} onClick={() => void runItem(item, "check")}>
+                    <RefreshCw size={15} />
+                    信息检查
+                  </button>
+                </div>
+                <ol className="config-check-steps">
+                  {config.manualSteps.map((step) => <li key={step}>{step}</li>)}
+                </ol>
+              </section>
+            );
+          })}
         </div>
       </section>
     </div>

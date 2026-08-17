@@ -839,92 +839,78 @@ form.panel {
   overflow-wrap: anywhere;
 }
 
-.config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  padding: 18px 18px 0;
-}
-
-.config-card,
-.config-section {
+.config-overview,
+.config-check-row {
   border: 1px solid #eef2f7;
   border-radius: 6px;
   background: #f8fafc;
 }
 
-.config-card {
+.config-overview {
   display: grid;
   gap: 8px;
+  margin: 18px 18px 0;
   padding: 12px;
 }
 
-.config-card span,
-.config-card small {
+.config-overview small,
+.config-check-copy small {
+  color: #667085;
   overflow-wrap: anywhere;
 }
 
-.config-section {
-  margin: 12px 18px;
+.config-check-list {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+}
+
+.config-check-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
   padding: 14px;
 }
 
-.config-section h3 {
-  margin-bottom: 8px;
+.config-check-row.passed .config-check-icon {
+  color: #067647;
 }
 
-.config-section p {
-  color: #475467;
-  line-height: 1.6;
+.config-check-row.failed .config-check-icon {
+  color: #b42318;
 }
 
-.config-section pre {
-  margin: 10px 0 0;
-  padding: 10px 12px;
-  overflow: auto;
-  border-radius: 6px;
-  color: #0f172a;
-  background: #ffffff;
-  border: 1px solid #dce3ee;
+.config-check-row.unknown .config-check-icon {
+  color: #b54708;
 }
 
-.record-table {
+.config-check-copy {
   display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  gap: 1px;
-  margin-top: 10px;
-  overflow: hidden;
-  border: 1px solid #dce3ee;
-  border-radius: 6px;
-  background: #dce3ee;
+  gap: 4px;
 }
 
-.record-table span,
-.record-table strong {
-  padding: 10px 12px;
-  background: #ffffff;
-  overflow-wrap: anywhere;
+.config-check-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
-.record-table span {
-  color: #667085;
-  font-weight: 800;
+.config-check-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 6px 8px;
+  font-size: 12px;
 }
 
-.config-steps {
-  margin: 10px 0 0;
-  padding-left: 22px;
+.config-check-steps {
+  grid-column: 2 / -1;
+  margin: 0;
+  padding-left: 20px;
   color: #475467;
   line-height: 1.7;
-}
-
-.config-steps li {
-  margin: 4px 0;
-}
-
-.config-steps strong {
-  color: #0f172a;
-  overflow-wrap: anywhere;
 }
 
 .detail {
@@ -1238,13 +1224,20 @@ form.panel {
   .two-col,
   .mode-tabs,
   .check,
-  .config-grid,
-  .record-table,
+  .config-check-row,
   .short-create-panel {
     grid-template-columns: 1fr;
   }
 
   .check {
     align-items: start;
+  }
+
+  .config-check-actions {
+    justify-content: flex-start;
+  }
+
+  .config-check-steps {
+    grid-column: auto;
   }
 }

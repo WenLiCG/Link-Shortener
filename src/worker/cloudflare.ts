@@ -246,7 +246,7 @@ export async function ensureDnsRecords(env: Env, zoneId: string, domain: string)
   await ensureWorkerDnsRecordForHost(env, zoneId, `*.${domain}`);
 }
 
-interface WorkerRoute {
+export interface WorkerRoute {
   id: string;
   pattern: string;
   script?: string | null;
@@ -288,6 +288,11 @@ export async function ensureWorkerRouteForHost(env: Env, zoneId: string, host: s
   const pattern = `${host}/*`;
   const routes = await cfRequest<WorkerRoute[]>(env, `/zones/${zoneId}/workers/routes`);
   await ensureWorkerRoute(env, zoneId, routes, pattern, script);
+}
+
+export async function findWorkerRouteForHost(env: Env, zoneId: string, host: string): Promise<WorkerRoute | null> {
+  const routes = await cfRequest<WorkerRoute[]>(env, `/zones/${zoneId}/workers/routes`);
+  return routes.find((route) => route.pattern === `${host}/*`) ?? null;
 }
 
 export async function getZone(env: Env, zoneId: string): Promise<CloudflareZone> {

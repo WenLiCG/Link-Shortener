@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "multi-domain-redirect-manager",
+  "name": "link-shortener-manager",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-06-14",
   "compatibility_flags": ["nodejs_compat_v2", "global_fetch_strictly_public"],
@@ -25,8 +25,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "multi-domain-redirect-manager",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_name": "link-shortener-manager",
+      "database_id": "96083922-dc4f-401e-8063-72351915ae7c",
       "migrations_dir": "./migrations"
     }
   ],
@@ -34,8 +34,8 @@
     "crons": ["* * * * *"]
   },
   "vars": {
-    "ADMIN_HOST": "admin.example.com",
-    "WORKER_SCRIPT_NAME": "multi-domain-redirect-manager",
+    "ADMIN_HOST": "link.g60.net",
+    "WORKER_SCRIPT_NAME": "link-shortener-manager",
     "DYNADOT_SANDBOX": "false",
     "VISIT_EVENT_RETENTION_DAYS": "30"
   }

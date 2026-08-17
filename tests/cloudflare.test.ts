@@ -8,7 +8,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 const env = {
   DB: {} as D1Database,
   ASSETS: {} as Fetcher,
-  ADMIN_HOST: "localhost",
+  ADMIN_HOST: "link.g60.net",
   DYNADOT_SANDBOX: "false",
   VISIT_EVENT_RETENTION_DAYS: "30",
   CLOUDFLARE_API_TOKEN: "token",

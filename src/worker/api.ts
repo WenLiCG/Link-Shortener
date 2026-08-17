@@ -38,6 +38,11 @@ import { configuredValue, hasConfiguredValue, secret } from "./env-utils";
 import { ProviderError } from "./provider-error";
 import { type RedirectMode, isValidDomain, normalizeDomain } from "./shared";
 import { refreshTargetHealth } from "./target-health";
+import {
+  checkTargetConfigurationItem,
+  configureTargetConfigurationItem,
+  type TargetConfigurationItem,
+} from "./target-configuration";
 
 interface LoginBody {
   password?: string;
@@ -477,6 +482,19 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       ctx.waitUntil(processNextJob(env));
       return ok({ ...created.target, jobId: created.jobId, jobStatus: "queued" }, { status: 202 });
     }
+  }
+
+  const targetConfigurationMatch = pathname.match(/^\/api\/targets\/([^/]+)\/configuration\/(zone|nameserver|dns|route)\/(check|configure)$/);
+  if (targetConfigurationMatch) {
+    assertMethod(request, "POST");
+    const [, targetId, rawItem, action] = targetConfigurationMatch;
+    if (!await getTargetById(env.DB, targetId)) {
+      throw new HttpError(404, "not_found", "目标服务不存在。");
+    }
+    const item = rawItem as TargetConfigurationItem;
+    return ok(action === "check"
+      ? await checkTargetConfigurationItem(env, targetId, item)
+      : await configureTargetConfigurationItem(env, targetId, item));
   }
 
   const targetForwardMatch = pathname.match(/^\/api\/targets\/([^/]+)\/forward$/);

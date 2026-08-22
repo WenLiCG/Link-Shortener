@@ -131,6 +131,16 @@ function optionalDomain(input: string | null | undefined): string | null {
   return value.length > 0 ? value : null;
 }
 
+function dateFilter(input: string | undefined): string | undefined {
+  if (!input) {
+    return undefined;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input) || Number.isNaN(Date.parse(`${input}T00:00:00Z`))) {
+    throw new HttpError(400, "bad_request", "日期筛选格式无效。");
+  }
+  return input;
+}
+
 function optionalRedirectUrl(input: string | null | undefined): string | null {
   const value = (input ?? "").trim();
   if (!value) {
@@ -623,12 +633,19 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/domains") {
     if (request.method === "GET") {
       const daysValue = query(url, "days");
+      const visitedFrom = dateFilter(query(url, "visitedFrom"));
+      const visitedTo = dateFilter(query(url, "visitedTo"));
+      if (visitedFrom && visitedTo && visitedFrom > visitedTo) {
+        throw new HttpError(400, "bad_request", "开始日期不能晚于结束日期。");
+      }
       return ok(
         await listDomains(env.DB, {
           search: query(url, "search"),
           groupId: query(url, "groupId"),
           status: query(url, "status"),
           days: daysValue ? Number(daysValue) : undefined,
+          visitedFrom,
+          visitedTo,
         }),
       );
     }

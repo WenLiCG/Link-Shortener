@@ -8,6 +8,10 @@ it("offers the domain time filter presets", () => {
   expect(source).toContain('<option value="0">今天</option>');
   expect(source).toContain('<option value="-1">昨天</option>');
   expect(source).toContain('<option value="7">过去 7 天</option>');
+  expect(source).toContain('type="date"');
+  expect(source).toContain('filters.visitedFrom');
+  expect(source).toContain('filters.visitedTo');
+  expect(source).toContain('cache: "no-store"');
 });
 
 it("shows visitor hash readiness in the initialization checks", () => {

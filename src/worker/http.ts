@@ -16,6 +16,7 @@ export function json<T>(data: T, init?: ResponseInit): Response {
     headers: {
       "content-type": "application/json; charset=utf-8",
       ...(init?.headers ?? {}),
+      "cache-control": "no-store",
     },
   });
 }

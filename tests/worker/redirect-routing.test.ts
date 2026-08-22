@@ -1,6 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { listShortLinks } from "../../src/worker/db";
+import { listShortLinks, summaryStats } from "../../src/worker/db";
+import { today } from "../../src/worker/shared";
 
 async function eventually(query: string, expected: number): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -25,6 +26,72 @@ beforeEach(async () => {
 });
 
 describe("redirect traffic writes", () => {
+  it("uses an HTTP redirect while suppressing the referrer", async () => {
+    await env.DB.prepare(
+      `INSERT INTO redirect_domains
+       (id, domain, redirect_mode, direct_target_host, hide_referer, status, list_visible)
+       VALUES ('domain-no-referer', 'entry.example.com', 'direct', 'https://destination.example/', 1, 'active', 1)`,
+    ).run();
+
+    const response = await SELF.fetch("https://entry.example.com/", {
+      redirect: "manual",
+      headers: { "user-agent": "Mozilla/5.0" },
+    });
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("https://destination.example/");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("rejects known scanner paths instead of redirecting them", async () => {
+    await env.DB.prepare(
+      `INSERT INTO redirect_domains
+       (id, domain, redirect_mode, direct_target_host, status, list_visible)
+       VALUES ('domain-scanner', 'entry.example.com', 'direct', 'https://destination.example/', 'active', 1)`,
+    ).run();
+
+    const response = await SELF.fetch("https://entry.example.com/.env", {
+      redirect: "manual",
+      headers: { "user-agent": "Mozilla/5.0", accept: "text/html" },
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  it("rejects non-navigation methods", async () => {
+    await env.DB.prepare(
+      `INSERT INTO redirect_domains
+       (id, domain, redirect_mode, direct_target_host, status, list_visible)
+       VALUES ('domain-method', 'entry.example.com', 'direct', 'https://destination.example/', 'active', 1)`,
+    ).run();
+
+    const response = await SELF.fetch("https://entry.example.com/", { method: "POST", redirect: "manual" });
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("GET, HEAD");
+  });
+
+  it("only includes visible active domains in summary traffic", async () => {
+    await env.DB.prepare(
+      `INSERT INTO redirect_domains
+       (id, domain, redirect_mode, direct_target_host, status, list_visible)
+       VALUES
+       ('domain-active', 'active.example.com', 'direct', 'https://destination.example/', 'active', 1),
+       ('domain-hidden', 'hidden.example.com', 'direct', 'https://destination.example/', 'active', 0)`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO traffic_daily_visitors
+       (subject_type, subject_id, day, visitor_key, first_seen_at)
+       VALUES
+       ('redirect_domain', 'domain-active', ?, 'active-visitor', '2026-08-20T00:00:00.000Z'),
+       ('redirect_domain', 'domain-hidden', ?, 'hidden-visitor', '2026-08-20T00:00:00.000Z'),
+       ('redirect_domain', 'removed-domain', ?, 'removed-visitor', '2026-08-20T00:00:00.000Z')`,
+    ).bind(today(), today(), today()).run();
+
+    await expect(summaryStats(env.DB)).resolves.toMatchObject({ visits: 1, visitsToday: 1 });
+  });
+
   it("returns a short-link redirect while recording its daily unique asynchronously", async () => {
     await env.DB.prepare(
       "INSERT INTO target_services (id, name, target_host) VALUES ('target-short', 'short', 'short.example.com')",

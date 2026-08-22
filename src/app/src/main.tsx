@@ -287,6 +287,7 @@ async function api<T>(
   try {
     const response = await fetch(path, {
       ...init,
+      cache: "no-store",
       signal: options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal,
       headers: {
         "content-type": "application/json",
@@ -834,7 +835,7 @@ function App() {
   const [registrars, setRegistrars] = useState<RegistrarStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [filters, setFilters] = useState({ search: "", groupId: "", status: "", days: "" });
+  const [filters, setFilters] = useState({ search: "", groupId: "", status: "", days: "", visitedFrom: "", visitedTo: "" });
 
   async function loadAll() {
     setLoading(true);
@@ -845,6 +846,8 @@ function App() {
       if (filters.groupId) params.set("groupId", filters.groupId);
       if (filters.status) params.set("status", filters.status);
       if (filters.days) params.set("days", filters.days);
+      if (filters.visitedFrom) params.set("visitedFrom", filters.visitedFrom);
+      if (filters.visitedTo) params.set("visitedTo", filters.visitedTo);
       const [domainData, targetData, shortLinkData, groupData, summaryData, settingsData, registrarData] = await Promise.all([
         api<RedirectDomain[]>(`/api/domains?${params.toString()}`),
         api<TargetService[]>("/api/targets"),
@@ -878,7 +881,7 @@ function App() {
     if (authenticated) {
       void loadAll();
     }
-  }, [authenticated, filters.groupId, filters.status, filters.days]);
+  }, [authenticated, filters.groupId, filters.status, filters.days, filters.visitedFrom, filters.visitedTo]);
 
   if (authenticated === null) {
     return (
@@ -1015,8 +1018,8 @@ function DomainsView({
   domains: RedirectDomain[];
   groups: DomainGroup[];
   summary: SummaryStats | null;
-  filters: { search: string; groupId: string; status: string; days: string };
-  setFilters: React.Dispatch<React.SetStateAction<{ search: string; groupId: string; status: string; days: string }>>;
+  filters: { search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string };
+  setFilters: React.Dispatch<React.SetStateAction<{ search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string }>>;
   onSearch: () => Promise<void>;
   onOpen: (id: string) => void;
   onDeleted: () => Promise<void>;
@@ -1083,11 +1086,11 @@ function DomainsView({
       <section className="metric-grid">
         <Metric icon={<Globe2 />} label="域名总数" value={summary?.totalDomains ?? 0} />
         <Metric icon={<CheckCircle2 />} label="可用域名" value={summary?.activeDomains ?? 0} />
-        <Metric icon={<Activity />} label="今日访问" value={summary?.visitsToday ?? 0} />
+        <Metric icon={<Activity />} label="今日候选 UV" value={summary?.visitsToday ?? 0} />
         <Metric icon={<AlertTriangle />} label="失败 / 等待" value={`${summary?.failedDomains ?? 0} / ${summary?.waitingDomains ?? 0}`} />
       </section>
       <div className="explain-note">
-        域名总数、可用域名、失败 / 等待是系统内全量入口域名统计；今日访问只统计今天流量。下方列表会受搜索、状态、Group 和时间筛选影响。
+        域名总数、可用域名、失败 / 等待是系统内全量入口域名统计；今日候选 UV 按入口域名、客户端 IP 和上海自然日去重，不等同于停放平台认可访问。下方列表会受搜索、状态、Group 和时间筛选影响。
       </div>
       <section className="toolbar">
         <div className="searchbox">
@@ -1111,7 +1114,7 @@ function DomainsView({
           <option value="waiting_nameserver">等待生效</option>
           <option value="failed">失败</option>
         </select>
-        <select value={filters.days} onChange={(event) => setFilters((current) => ({ ...current, days: event.target.value }))}>
+        <select value={filters.days} onChange={(event) => setFilters((current) => ({ ...current, days: event.target.value, visitedFrom: "", visitedTo: "" }))}>
           <option value="">全部时间</option>
           <option value="0">今天</option>
           <option value="-1">昨天</option>
@@ -1121,6 +1124,21 @@ function DomainsView({
           <option value="180">过去半年</option>
           <option value="365">过去一年</option>
         </select>
+        <input
+          aria-label="开始日期"
+          type="date"
+          value={filters.visitedFrom}
+          max={filters.visitedTo || undefined}
+          onChange={(event) => setFilters((current) => ({ ...current, days: "", visitedFrom: event.target.value }))}
+        />
+        <span>至</span>
+        <input
+          aria-label="结束日期"
+          type="date"
+          value={filters.visitedTo}
+          min={filters.visitedFrom || undefined}
+          onChange={(event) => setFilters((current) => ({ ...current, days: "", visitedTo: event.target.value }))}
+        />
         <button className="ghost" onClick={() => void onSearch()}><Filter size={16} />筛选</button>
         <button className="danger" disabled={selected.length === 0 || deleting} onClick={() => void deleteSelected()}><Trash2 size={16} />删除</button>
       </section>
@@ -2684,7 +2702,7 @@ function DetailView({ id, onBack, onUpdated }: { id: string; onBack: () => void;
         </div>
       </div>
       <section className="metric-grid">
-        <Metric icon={<Activity />} label="总访问" value={detail.traffic} />
+        <Metric icon={<Activity />} label="累计候选 UV" value={detail.traffic} />
         <Metric icon={<Shield />} label="Referer" value={detail.hideReferer ? "隐藏" : "普通"} />
         <Metric icon={<Cloud />} label="Cloudflare" value={detail.cloudflareZoneStatus ?? "-"} />
         <Metric icon={<Globe2 />} label="Dynadot" value={statusText(detail.dynadotStatus)} />
@@ -2706,7 +2724,7 @@ function DetailView({ id, onBack, onUpdated }: { id: string; onBack: () => void;
       </div>
       <div className="panel">
         <h3>最近访问</h3>
-        {detail.recentVisits.length === 0 ? <EmptyState title="暂无访问" text="跳转请求进入后会记录最近 50 条明细。" /> : (
+        {detail.recentVisits.length === 0 ? <EmptyState title="暂无候选访问" text="符合候选规则的跳转请求会记录最近 50 条明细。" /> : (
           <table>
             <thead><tr><th>时间</th><th>Host</th><th>路径</th><th>来源</th><th>国家</th></tr></thead>
             <tbody>

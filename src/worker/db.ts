@@ -504,6 +504,8 @@ export interface DomainListFilters {
   groupId?: string;
   status?: string;
   days?: number;
+  visitedFrom?: string;
+  visitedTo?: string;
   includeHidden?: boolean;
 }
 
@@ -527,12 +529,20 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
   }
   if (filters.days !== undefined) {
     if (filters.days === 0 || filters.days === -1) {
-      clauses.push("date(d.created_at, '+8 hours') = date(?)");
+      clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day = ?)");
       binds.push(daysAgo(-filters.days));
     } else if (filters.days > 0) {
-      clauses.push("date(d.created_at, '+8 hours') >= date(?)");
-      binds.push(daysAgo(filters.days - 1));
+      clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day BETWEEN ? AND ?)");
+      binds.push(daysAgo(filters.days - 1), today());
     }
+  }
+  if (filters.visitedFrom) {
+    clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day >= ?)");
+    binds.push(filters.visitedFrom);
+  }
+  if (filters.visitedTo) {
+    clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day <= ?)");
+    binds.push(filters.visitedTo);
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   return (
@@ -1042,8 +1052,21 @@ export async function summaryStats(db: D1Database): Promise<SummaryStats> {
      FROM redirect_domains
      WHERE list_visible = 1`,
   );
-  const visits = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain'");
-  const visitsToday = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND day = ?", today());
+  const visits = await first(
+    db,
+    `SELECT COUNT(*) AS visits
+     FROM traffic_daily_visitors v
+     JOIN redirect_domains d ON d.id = v.subject_id
+     WHERE v.subject_type = 'redirect_domain' AND d.list_visible = 1 AND d.status = 'active'`,
+  );
+  const visitsToday = await first(
+    db,
+    `SELECT COUNT(*) AS visits
+     FROM traffic_daily_visitors v
+     JOIN redirect_domains d ON d.id = v.subject_id
+     WHERE v.subject_type = 'redirect_domain' AND d.list_visible = 1 AND d.status = 'active' AND v.day = ?`,
+    today(),
+  );
   return {
     totalDomains: numberValue(domainStats?.total ?? 0),
     activeDomains: numberValue(domainStats?.active ?? 0),

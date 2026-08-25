@@ -111,7 +111,7 @@ git add src/worker/db.ts src/app/src/main.tsx tests/worker/domain-list-filters.t
 git commit -m "fix: scope domain traffic to selected time"
 ```
 
-- [ ] **Step 3: Deploy and verify production**
+- [x] **Step 3: Deploy and verify production**
 
 Run: `npm.cmd run deploy; npx.cmd wrangler deployments list --name link-shortener-manager --json`
 

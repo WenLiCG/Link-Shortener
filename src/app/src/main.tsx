@@ -905,6 +905,8 @@ function App() {
     setView("detail");
   }
 
+  const hasTimeFilter = Boolean(filters.days || filters.visitedFrom || filters.visitedTo);
+
   async function logout() {
     await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setAuthenticated(false);
@@ -986,6 +988,7 @@ function App() {
             groups={groups}
             summary={summary}
             filters={filters}
+            hasTimeFilter={hasTimeFilter}
             setFilters={setFilters}
             onSearch={loadAll}
             onOpen={openDetail}
@@ -1010,6 +1013,7 @@ function DomainsView({
   groups,
   summary,
   filters,
+  hasTimeFilter,
   setFilters,
   onSearch,
   onOpen,
@@ -1019,6 +1023,7 @@ function DomainsView({
   groups: DomainGroup[];
   summary: SummaryStats | null;
   filters: { search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string };
+  hasTimeFilter: boolean;
   setFilters: React.Dispatch<React.SetStateAction<{ search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string }>>;
   onSearch: () => Promise<void>;
   onOpen: (id: string) => void;
@@ -1155,7 +1160,7 @@ function DomainsView({
                 <th>目标</th>
                 <th>Group</th>
                 <th>状态</th>
-                <th>流量</th>
+                <th>{hasTimeFilter ? "区间候选 UV" : "累计候选 UV"}</th>
                 <th>Referer</th>
                 <th>NS / DNS / Route</th>
                 <th>最近访问</th>

@@ -54,4 +54,21 @@ describe("domain list date filters", () => {
 
     await expectDomains({ visitedFrom: "2026-08-10", visitedTo: "2026-08-11" }, ["first", "last"]);
   });
+
+  it("uses one visitor interval for membership and traffic totals", async () => {
+    await insertDomain("spanning", "2026-01-01T00:00:00.000Z");
+    await insertDomain("inside", "2026-01-01T00:00:00.000Z");
+    await recordVisit("spanning", "2026-08-09");
+    await recordVisit("spanning", "2026-08-12");
+    await recordVisit("inside", "2026-08-09");
+    await recordVisit("inside", "2026-08-10");
+    await recordVisit("inside", "2026-08-11");
+    await recordVisit("inside", "2026-08-12");
+
+    const domains = await listDomains(env.DB, { visitedFrom: "2026-08-10", visitedTo: "2026-08-11" });
+
+    expect(domains.map((domain) => domain.id)).toEqual(["inside"]);
+    expect(domains[0]?.traffic).toBe(2);
+    expect(domains[0]?.lastAccessedAt).toBe("2026-08-11T00:00:00.000Z");
+  });
 });

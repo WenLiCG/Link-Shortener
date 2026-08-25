@@ -512,6 +512,8 @@ export interface DomainListFilters {
 export async function listDomains(db: D1Database, filters: DomainListFilters): Promise<RedirectDomain[]> {
   const clauses: string[] = [];
   const binds: unknown[] = [];
+  const visitorDateConditions: string[] = [];
+  const visitorBinds: unknown[] = [];
   if (!filters.includeHidden) {
     clauses.push("d.list_visible = 1");
   }
@@ -529,26 +531,32 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
   }
   if (filters.days !== undefined) {
     if (filters.days === 0 || filters.days === -1) {
-      clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day = ?)");
-      binds.push(daysAgo(-filters.days));
+      visitorDateConditions.push("v.day = ?");
+      visitorBinds.push(daysAgo(-filters.days));
     } else if (filters.days > 0) {
-      clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day BETWEEN ? AND ?)");
-      binds.push(daysAgo(filters.days - 1), today());
+      visitorDateConditions.push("v.day BETWEEN ? AND ?");
+      visitorBinds.push(daysAgo(filters.days - 1), today());
     }
   }
   if (filters.visitedFrom) {
-    clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day >= ?)");
-    binds.push(filters.visitedFrom);
+    visitorDateConditions.push("v.day >= ?");
+    visitorBinds.push(filters.visitedFrom);
   }
   if (filters.visitedTo) {
-    clauses.push("EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND v.day <= ?)");
-    binds.push(filters.visitedTo);
+    visitorDateConditions.push("v.day <= ?");
+    visitorBinds.push(filters.visitedTo);
+  }
+  if (visitorDateConditions.length > 0) {
+    clauses.push("EXISTS (SELECT 1 FROM filtered_visits v WHERE v.subject_id = d.id)");
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  const visitorWhere = ["v.subject_type = 'redirect_domain'", ...visitorDateConditions].join(" AND ");
+  const visitorCte = `WITH filtered_visits AS (SELECT subject_id, visitor_key, first_seen_at FROM traffic_daily_visitors v WHERE ${visitorWhere})`;
   return (
     await all(
       db,
-      `SELECT d.*, CASE WHEN d.redirect_mode = 'direct' THEN d.direct_target_host ELSE COALESCE(t.target_host, d.deleted_target_host, '') END AS target_host,
+      `${visitorCte}
+       SELECT d.*, CASE WHEN d.redirect_mode = 'direct' THEN d.direct_target_host ELSE COALESCE(t.target_host, d.deleted_target_host, '') END AS target_host,
         CASE
           WHEN d.redirect_mode = 'direct' THEN '直接跳转'
           WHEN d.target_service_id IS NULL AND d.deleted_target_host IS NOT NULL THEN '目标服务已删除'
@@ -556,14 +564,15 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
           ELSE t.name
         END AS target_name,
         g.name AS group_name,
-        COALESCE((SELECT COUNT(*) FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id), 0) AS traffic,
-        (SELECT MAX(first_seen_at) FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id) AS traffic_last_accessed_at
+        COALESCE((SELECT COUNT(*) FROM filtered_visits v WHERE v.subject_id = d.id), 0) AS traffic,
+        (SELECT MAX(first_seen_at) FROM filtered_visits v WHERE v.subject_id = d.id) AS traffic_last_accessed_at
        FROM redirect_domains d
        LEFT JOIN target_services t ON t.id = d.target_service_id
        LEFT JOIN groups g ON g.id = d.group_id
        ${where}
        GROUP BY d.id
        ORDER BY d.created_at DESC`,
+      ...visitorBinds,
       ...binds,
     )
   ).map(mapDomain);

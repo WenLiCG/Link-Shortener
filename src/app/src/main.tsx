@@ -28,6 +28,7 @@ import {
   X,
 } from "lucide-react";
 import { runSerialBatch } from "./batch";
+import { domainFilterAction, emptyDomainFilters, type DomainFilters } from "./domain-filters";
 import { useOperationPolling } from "./hooks/useOperationPolling";
 import {
   initialConfigurationResult,
@@ -835,19 +836,20 @@ function App() {
   const [registrars, setRegistrars] = useState<RegistrarStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [filters, setFilters] = useState({ search: "", groupId: "", status: "", days: "", visitedFrom: "", visitedTo: "" });
+  const [filters, setFilters] = useState<DomainFilters>(emptyDomainFilters);
+  const [appliedFilters, setAppliedFilters] = useState<DomainFilters>(emptyDomainFilters);
 
-  async function loadAll() {
+  async function loadAll(activeFilters = appliedFilters) {
     setLoading(true);
     setError("");
     try {
       const params = new URLSearchParams();
-      if (filters.search) params.set("search", filters.search);
-      if (filters.groupId) params.set("groupId", filters.groupId);
-      if (filters.status) params.set("status", filters.status);
-      if (filters.days) params.set("days", filters.days);
-      if (filters.visitedFrom) params.set("visitedFrom", filters.visitedFrom);
-      if (filters.visitedTo) params.set("visitedTo", filters.visitedTo);
+      if (activeFilters.search) params.set("search", activeFilters.search);
+      if (activeFilters.groupId) params.set("groupId", activeFilters.groupId);
+      if (activeFilters.status) params.set("status", activeFilters.status);
+      if (activeFilters.days) params.set("days", activeFilters.days);
+      if (activeFilters.visitedFrom) params.set("visitedFrom", activeFilters.visitedFrom);
+      if (activeFilters.visitedTo) params.set("visitedTo", activeFilters.visitedTo);
       const [domainData, targetData, shortLinkData, groupData, summaryData, settingsData, registrarData] = await Promise.all([
         api<RedirectDomain[]>(`/api/domains?${params.toString()}`),
         api<TargetService[]>("/api/targets"),
@@ -881,7 +883,7 @@ function App() {
     if (authenticated) {
       void loadAll();
     }
-  }, [authenticated, filters.groupId, filters.status, filters.days, filters.visitedFrom, filters.visitedTo]);
+  }, [authenticated]);
 
   if (authenticated === null) {
     return (
@@ -905,7 +907,19 @@ function App() {
     setView("detail");
   }
 
-  const hasTimeFilter = Boolean(filters.days || filters.visitedFrom || filters.visitedTo);
+  const hasTimeFilter = Boolean(appliedFilters.days || appliedFilters.visitedFrom || appliedFilters.visitedTo);
+
+  async function applyFilters() {
+    setAppliedFilters(filters);
+    await loadAll(filters);
+  }
+
+  async function resetFilters() {
+    const nextFilters = emptyDomainFilters();
+    setFilters(nextFilters);
+    setAppliedFilters(nextFilters);
+    await loadAll(nextFilters);
+  }
 
   async function logout() {
     await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
@@ -988,9 +1002,11 @@ function App() {
             groups={groups}
             summary={summary}
             filters={filters}
+            appliedFilters={appliedFilters}
             hasTimeFilter={hasTimeFilter}
             setFilters={setFilters}
-            onSearch={loadAll}
+            onSearch={applyFilters}
+            onReset={resetFilters}
             onOpen={openDetail}
             onDeleted={loadAll}
           />
@@ -1013,25 +1029,30 @@ function DomainsView({
   groups,
   summary,
   filters,
+  appliedFilters,
   hasTimeFilter,
   setFilters,
   onSearch,
+  onReset,
   onOpen,
   onDeleted,
 }: {
   domains: RedirectDomain[];
   groups: DomainGroup[];
   summary: SummaryStats | null;
-  filters: { search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string };
+  filters: DomainFilters;
+  appliedFilters: DomainFilters;
   hasTimeFilter: boolean;
-  setFilters: React.Dispatch<React.SetStateAction<{ search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string }>>;
+  setFilters: React.Dispatch<React.SetStateAction<DomainFilters>>;
   onSearch: () => Promise<void>;
+  onReset: () => Promise<void>;
   onOpen: (id: string) => void;
   onDeleted: () => Promise<void>;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
   const [retryingIds, setRetryingIds] = useState<string[]>([]);
+  const filterAction = domainFilterAction(filters, appliedFilters);
   const [message, setMessage] = useState("");
 
   async function deleteSelected() {
@@ -1144,7 +1165,7 @@ function DomainsView({
           min={filters.visitedFrom || undefined}
           onChange={(event) => setFilters((current) => ({ ...current, days: "", visitedTo: event.target.value }))}
         />
-        <button className="ghost" onClick={() => void onSearch()}><Filter size={16} />筛选</button>
+        <button className="ghost" onClick={() => void (filterAction === "reset" ? onReset() : onSearch())}><Filter size={16} />{filterAction === "reset" ? "重置" : "筛选"}</button>
         <button className="danger" disabled={selected.length === 0 || deleting} onClick={() => void deleteSelected()}><Trash2 size={16} />删除</button>
       </section>
       {message && <div className="form-error">{message}</div>}

@@ -1,4 +1,4 @@
-import { deleteZoneByName, ensureDnsRecords, ensureWorkerRoutes, ensureZone, getZone } from "./cloudflare";
+import { type CloudflareZone, deleteZoneByName, ensureDnsRecords, ensureWorkerRoutes, ensureZone, getZone } from "./cloudflare";
 import {
   addJobStep,
   claimNextJob,
@@ -6,7 +6,7 @@ import {
   completeJob,
   deleteDomains,
   deleteTarget,
-  getDomainForAutomation,
+  getDomainById,
   getTargetById,
   recordJobFailure,
   setJobResult,
@@ -36,13 +36,33 @@ async function processDomainJob(env: Env, job: DomainJob): Promise<Record<string
   if (!domainId) {
     throw new Error("missing_redirect_domain_id");
   }
-  const domain = await getDomainForAutomation(env.DB, domainId);
+  const domain = await getDomainById(env.DB, domainId);
   if (!domain) {
     throw new Error("domain_not_found");
   }
 
   try {
-    await step(env.DB, job.id, "validating", async () => {
+    let zoneId = domain.cloudflareZoneId;
+    let nameservers = domain.cloudflareNameservers;
+    let propagationZone: CloudflareZone | null = null;
+    if (job.attemptCount > 1 && job.currentStep === "waiting_nameserver"
+      && zoneId && domain.cloudflareZoneStatus === "pending"
+      && (domain.status === "waiting_nameserver" || domain.status === "active")
+      && domain.dnsStatus === "configured" && domain.routeStatus === "configured") {
+      try {
+        const zone = await getZone(env, zoneId);
+        if (zone.id === zoneId && zone.name === domain.domain
+          && [...zone.nameServers].sort().join() === [...nameservers].sort().join()) {
+          propagationZone = zone;
+        }
+      } catch (error) {
+        if (!(error instanceof ProviderError && error.status === 404)) {
+          throw error;
+        }
+      }
+    }
+
+    if (!propagationZone) await step(env.DB, job.id, "validating", async () => {
       if (!isValidDomain(domain.domain)) {
         throw new Error("invalid_domain");
       }
@@ -53,9 +73,7 @@ async function processDomainJob(env: Env, job: DomainJob): Promise<Record<string
       });
     });
 
-    let zoneId = domain.cloudflareZoneId;
-    let nameservers = domain.cloudflareNameservers;
-    await step(env.DB, job.id, "cloudflare_zone", async () => {
+    if (!propagationZone) await step(env.DB, job.id, "cloudflare_zone", async () => {
       const zone = await ensureZone(env, domain.domain);
       zoneId = zone.id;
       nameservers = zone.nameServers;
@@ -67,11 +85,14 @@ async function processDomainJob(env: Env, job: DomainJob): Promise<Record<string
       });
     });
 
-    await step(env.DB, job.id, "nameserver_update", async () => {
+    if (!propagationZone) await step(env.DB, job.id, "nameserver_update", async () => {
       if (nameservers.length === 0) {
         throw new Error("cloudflare_nameservers_missing");
       }
-      if (domain.nameserverStatus === "submitted" || domain.nameserverStatus === "active") {
+      const sameNameservers = domain.cloudflareZoneId === zoneId
+        && [...domain.cloudflareNameservers].sort().join() === [...nameservers].sort().join();
+      if (sameNameservers && (domain.nameserverStatus === "submitted" || domain.nameserverStatus === "active"
+        || domain.dynadotStatus === "updated")) {
         return;
       }
       const ownedByDynadot = await isDomainInDynadot(env, domain.domain);
@@ -92,7 +113,7 @@ async function processDomainJob(env: Env, job: DomainJob): Promise<Record<string
       });
     });
 
-    await step(env.DB, job.id, "dns_configured", async () => {
+    if (!propagationZone) await step(env.DB, job.id, "dns_configured", async () => {
       if (!zoneId) {
         throw new Error("cloudflare_zone_id_missing");
       }
@@ -108,15 +129,17 @@ async function processDomainJob(env: Env, job: DomainJob): Promise<Record<string
       if (!zoneId) {
         throw new Error("cloudflare_zone_id_missing");
       }
-      await ensureWorkerRoutes(env, zoneId, domain.domain);
-      const latestZone = await getZone(env, zoneId);
+      if (!propagationZone) {
+        await ensureWorkerRoutes(env, zoneId, domain.domain);
+      }
+      const latestZone = propagationZone ?? await getZone(env, zoneId);
       const active = latestZone.status === "active";
       zoneStatus = latestZone.status;
       await updateDomainAutomation(env.DB, domain.id, {
         status: active ? "active" : "waiting_nameserver",
         routeStatus: "configured",
         cloudflareZoneStatus: latestZone.status,
-        nameserverStatus: active ? "active" : "waiting",
+        nameserverStatus: active ? "active" : undefined,
         listVisible: active,
         lastError: null,
         lastCheckedAt: new Date().toISOString(),
@@ -179,7 +202,7 @@ async function runJob(env: Env, job: DomainJob): Promise<Record<string, unknown>
     case "domain_delete":
       return { deleted: await deleteDomains(env.DB, [job.subjectId]), id: job.subjectId };
     case "target_repair":
-      await repairTargetService(env, job.subjectId);
+      await repairTargetService(env, job.subjectId, job.attemptCount > 1 && job.currentStep === "waiting_nameserver");
       return { id: job.subjectId, repaired: true };
     case "target_delete": {
       const target = await getTargetById(env.DB, job.subjectId);

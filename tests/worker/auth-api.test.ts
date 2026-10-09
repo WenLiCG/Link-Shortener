@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { handleApi } from "../../src/worker/api";
-import { hashPasswordForDocs } from "../../src/worker/auth";
+import { assertLoginAllowed, hashPasswordForDocs, recordLoginFailure } from "../../src/worker/auth";
 
 const password = "correct horse battery staple";
 const testEnv = env as Env & { PASSWORD_PEPPER: string };
@@ -31,6 +31,16 @@ beforeEach(async () => {
 });
 
 describe("authenticated mutations", () => {
+  it("rejects a cross-origin login before checking the password", async () => {
+    const response = await SELF.fetch("https://admin.example.com/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://attacker.example" },
+      body: JSON.stringify({ password }),
+    });
+    expect(response.status).toBe(403);
+    expect(response.headers.get("set-cookie")).toBeNull();
+  });
+
   it("rejects an explicit cross-origin request", async () => {
     const cookie = await login();
     const response = await SELF.fetch("https://admin.example.com/api/auth/password", {
@@ -94,6 +104,19 @@ describe("authenticated mutations", () => {
 });
 
 describe("session lifecycle", () => {
+  it("distinguishes a missing session from incorrect login credentials", async () => {
+    const expired = await SELF.fetch("https://admin.example.com/api/settings/check");
+    expect(expired.status).toBe(401);
+    await expect(expired.json()).resolves.toMatchObject({ error: { code: "session_expired" } });
+    const wrongPassword = await SELF.fetch("https://admin.example.com/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "wrong password" }),
+    });
+    expect(wrongPassword.status).toBe(401);
+    await expect(wrongPassword.json()).resolves.toMatchObject({ error: { code: "unauthorized" } });
+  });
+
   it("reports visitor hash readiness without revealing the secret", async () => {
     const cookie = await login();
     const response = await SELF.fetch("https://admin.example.com/api/settings/check", {
@@ -132,6 +155,7 @@ describe("session lifecycle", () => {
     });
 
     expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "session_expired" } });
   });
 
   it("does not hide a server configuration failure as an anonymous session", async () => {
@@ -151,6 +175,29 @@ describe("session lifecycle", () => {
 });
 
 describe("login throttling", () => {
+  it("allows login and starts a new failure window exactly when the block expires", async () => {
+    const request = new Request("https://admin.example.com/api/auth/login", {
+      headers: { "cf-connecting-ip": "192.0.2.49" },
+    });
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await recordLoginFailure(request, env);
+      }
+      clock.mockReturnValue(start + 15 * 60_000 - 1);
+      await expect(assertLoginAllowed(request, env)).rejects.toMatchObject({ status: 429 });
+      clock.mockReturnValue(start + 15 * 60_000);
+      await expect(assertLoginAllowed(request, env)).resolves.toBeUndefined();
+      await recordLoginFailure(request, env);
+      const stored = await env.DB.prepare("SELECT value FROM settings WHERE key LIKE 'login_fail:%'").first<string>("value");
+      expect(JSON.parse(stored!)).toEqual({ count: 1, firstAt: start + 15 * 60_000, blockedUntil: 0 });
+      await expect(assertLoginAllowed(request, env)).resolves.toBeUndefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("blocks the sixth failed login from the same address", async () => {
     const statuses: number[] = [];
     for (let attempt = 0; attempt < 6; attempt += 1) {

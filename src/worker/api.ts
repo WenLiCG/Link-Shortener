@@ -19,6 +19,7 @@ import {
   ensureGroup,
   findDomainByName,
   findTargetByHost,
+  getDomainById,
   getDomainDetail,
   getJobById,
   getTargetById,
@@ -126,6 +127,17 @@ function optionalDomain(input: string | null | undefined): string | null {
   return value.length > 0 ? value : null;
 }
 
+function dateFilter(input: string | undefined): string | undefined {
+  if (!input) {
+    return undefined;
+  }
+  const date = new Date(`${input}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input) || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== input) {
+    throw new HttpError(400, "bad_request", "日期筛选格式无效。");
+  }
+  return input;
+}
+
 function optionalRedirectUrl(input: string | null | undefined): string | null {
   const value = (input ?? "").trim();
   if (!value) {
@@ -169,8 +181,16 @@ const RESERVED_SHORT_CODES = new Set(["api", "go", "admin", "login", "logout", "
 
 function randomShortCode(length = 6): string {
   const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (byte) => SHORT_CODE_ALPHABET[byte % SHORT_CODE_ALPHABET.length]).join("");
+  const limit = 256 - (256 % SHORT_CODE_ALPHABET.length);
+  let code = "";
+  while (code.length < length) {
+    crypto.getRandomValues(bytes);
+    for (const byte of bytes) {
+      if (byte < limit) code += SHORT_CODE_ALPHABET[byte % SHORT_CODE_ALPHABET.length];
+      if (code.length === length) break;
+    }
+  }
+  return code;
 }
 
 async function generateShortCode(db: D1Database, targetServiceId: string): Promise<string> {
@@ -289,6 +309,10 @@ async function enqueueCloudflareZoneDelete(env: Env, request: Request, input: De
 export async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const pathname = url.pathname;
+  const origin = request.headers.get("origin");
+  if (request.method !== "GET" && request.method !== "HEAD" && origin && origin !== url.origin) {
+    throw new HttpError(403, "forbidden", "请求来源无效。");
+  }
 
   if (pathname === "/api/auth/login") {
     assertMethod(request, "POST");
@@ -329,10 +353,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   }
 
   await requireSession(request, env);
-  const origin = request.headers.get("origin");
-  if (request.method !== "GET" && request.method !== "HEAD" && origin && origin !== url.origin) {
-    throw new HttpError(403, "forbidden", "请求来源无效。");
-  }
 
   if (pathname === "/api/auth/logout") {
     assertMethod(request, "POST");
@@ -380,6 +400,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/settings/check") {
     assertMethod(request, "GET");
     const visitorHashSecret = secret(env, "VISITOR_HASH_SECRET");
+    const retentionDays = Number(env.VISIT_EVENT_RETENTION_DAYS);
     return ok({
       adminHost: env.ADMIN_HOST || null,
       workerScriptName: env.WORKER_SCRIPT_NAME || "link-shortener-manager",
@@ -391,7 +412,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       hasCloudflareApiToken: Boolean(secret(env, "CLOUDFLARE_API_TOKEN")),
       hasDynadotApiKey: Boolean(secret(env, "DYNADOT_API_KEY")),
       dynadotSandbox: String(await configuredValue(env, "DYNADOT_SANDBOX")) === "true",
-      visitEventRetentionDays: Number(env.VISIT_EVENT_RETENTION_DAYS || "30"),
+      visitEventRetentionDays: Number.isInteger(retentionDays) && retentionDays > 0 ? retentionDays : 30,
     });
   }
 
@@ -598,12 +619,19 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/domains") {
     if (request.method === "GET") {
       const daysValue = query(url, "days");
+      const visitedFrom = dateFilter(query(url, "visitedFrom"));
+      const visitedTo = dateFilter(query(url, "visitedTo"));
+      if (visitedFrom && visitedTo && visitedFrom > visitedTo) {
+        throw new HttpError(400, "bad_request", "开始日期不能晚于结束日期。");
+      }
       return ok(
         await listDomains(env.DB, {
           search: query(url, "search"),
           groupId: query(url, "groupId"),
           status: query(url, "status"),
           days: daysValue ? Number(daysValue) : undefined,
+          visitedFrom,
+          visitedTo,
         }),
       );
     }
@@ -650,14 +678,20 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
         const existing = await findDomainByName(env.DB, domain);
         if (existing) {
           if (!existing.listVisible) {
-            const detail = await getDomainDetail(env.DB, existing.id);
-            const pendingJob = detail?.jobs.find((job) => (
-              job.status === "queued" || job.status === "running" || job.status === "retry_wait"
-            ));
-            const job = pendingJob ?? await retryDomain(
+            if (
+              existing.redirectMode !== redirectMode ||
+              existing.targetServiceId !== (redirectMode === "target_service_forward" ? body.targetServiceId : null) ||
+              existing.directTargetHost !== (redirectMode === "direct" ? directTargetHost : null) ||
+              existing.targetForwardHost !== (redirectMode === "target_service_forward" ? targetForwardHost : null) ||
+              existing.groupId !== groupId || existing.hideReferer !== Boolean(body.hideReferer)
+            ) {
+              results.push({ domain, ok: false, error: "域名已存在，提交的配置与原配置不同。请按原配置重试，或先删除系统配置后重新添加。" });
+              continue;
+            }
+            const job = await retryDomain(
               env.DB,
               existing.id,
-              `domain_retry:${existing.id}:${existing.lastCheckedAt ?? existing.createdAt}`,
+              idempotencyKey(request, "domain_retry", `${existing.id}:${crypto.randomUUID()}`),
             );
             ctx.waitUntil(processNextJob(env));
             results.push({ domain, ok: true, id: existing.id, jobId: job.id });
@@ -739,14 +773,14 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   const retryMatch = pathname.match(/^\/api\/domains\/([^/]+)\/retry$/);
   if (retryMatch) {
     assertMethod(request, "POST");
-    const detail = await getDomainDetail(env.DB, retryMatch[1]);
+    const detail = await getDomainById(env.DB, retryMatch[1]);
     if (!detail) {
       throw new HttpError(404, "not_found", "域名不存在。");
     }
     const job = await retryDomain(
       env.DB,
       retryMatch[1],
-      `domain_retry:${detail.id}:${detail.lastCheckedAt ?? detail.createdAt}`,
+      idempotencyKey(request, "domain_retry", `${detail.id}:${crypto.randomUUID()}`),
     );
     ctx.waitUntil(processNextJob(env));
     return ok({ jobId: job.id, status: job.status }, { status: 202 });

@@ -12,6 +12,7 @@ describe("redirect visit accounting", () => {
       accept: "text/html,application/xhtml+xml",
       "sec-fetch-dest": "document",
       "sec-fetch-mode": "navigate",
+      "user-agent": "Mozilla/5.0",
     }))).toBe(true);
   });
 
@@ -30,6 +31,24 @@ describe("redirect visit accounting", () => {
   it("skips bots and preview fetches", () => {
     expect(shouldRecordPageView(request("/", { "user-agent": "Googlebot/2.1", accept: "text/html" }))).toBe(false);
     expect(shouldRecordPageView(request("/", { "user-agent": "facebookexternalhit/1.1", accept: "text/html" }))).toBe(false);
+  });
+
+  it("skips verified bots even when they use a browser user agent", () => {
+    const navigation = request("/", { "user-agent": "Mozilla/5.0", accept: "text/html" });
+    Object.defineProperty(navigation, "cf", { value: { botManagement: { verifiedBot: true } } });
+    expect(shouldRecordPageView(navigation)).toBe(false);
+  });
+
+  it("skips requests without a user agent", () => {
+    expect(shouldRecordPageView(request("/", {
+      accept: "text/html",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+    }))).toBe(false);
+  });
+
+  it("skips command-line clients", () => {
+    expect(shouldRecordPageView(request("/", { "user-agent": "curl/8.0", accept: "text/html" }))).toBe(false);
   });
 
   it("builds a daily, subject-scoped anonymous visitor key from Cloudflare IP headers", async () => {

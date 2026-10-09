@@ -11,27 +11,63 @@ async function insertDomain(id: string, createdAt: string): Promise<void> {
   ).bind(id, `${id}.example.com`, createdAt).run();
 }
 
-async function expectDomains(filters: { days: number }, expected: string[]): Promise<void> {
+async function recordVisit(id: string, day: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO traffic_daily_visitors
+     (subject_type, subject_id, day, visitor_key, first_seen_at)
+     VALUES ('redirect_domain', ?, ?, ?, ?)`,
+  ).bind(id, day, `${id}-${day}`, `${day}T00:00:00.000Z`).run();
+}
+
+async function expectDomains(filters: { days?: number; visitedFrom?: string; visitedTo?: string }, expected: string[]): Promise<void> {
   expect((await listDomains(env.DB, filters)).map((domain) => domain.id).sort()).toEqual(expected.sort());
 }
 
 beforeEach(async () => {
+  await env.DB.prepare("DELETE FROM traffic_daily_visitors").run();
   await env.DB.prepare("DELETE FROM redirect_domains").run();
 });
 
 describe("domain list date filters", () => {
-  it("filters domains by today, yesterday, and seven calendar days", async () => {
-    await insertDomain("today", today());
-    await insertDomain("cstToday", new Date(`${today()}T00:30:00+08:00`).toISOString());
-    await insertDomain("yesterday", daysAgo(1));
-    await insertDomain("week", daysAgo(6));
-    await insertDomain("old", daysAgo(7));
-    await insertDomain("thirtyDays", daysAgo(29));
-    await insertDomain("thirtyOneDays", daysAgo(30));
+  it("filters domains by their visitor days instead of their creation dates", async () => {
+    await Promise.all(["today", "yesterday", "week", "old", "thirtyDays", "thirtyOneDays", "future"].map((id) => insertDomain(id, daysAgo(100))));
+    await recordVisit("today", today());
+    await recordVisit("yesterday", daysAgo(1));
+    await recordVisit("week", daysAgo(6));
+    await recordVisit("old", daysAgo(7));
+    await recordVisit("thirtyDays", daysAgo(29));
+    await recordVisit("thirtyOneDays", daysAgo(30));
+    await recordVisit("future", daysAgo(-1));
 
-    await expectDomains({ days: 0 }, ["today", "cstToday"]);
+    await expectDomains({ days: 0 }, ["today"]);
     await expectDomains({ days: -1 }, ["yesterday"]);
-    await expectDomains({ days: 7 }, ["today", "cstToday", "yesterday", "week"]);
-    await expectDomains({ days: 30 }, ["today", "cstToday", "yesterday", "week", "old", "thirtyDays"]);
+    await expectDomains({ days: 7 }, ["today", "yesterday", "week"]);
+    await expectDomains({ days: 30 }, ["today", "yesterday", "week", "old", "thirtyDays"]);
+  });
+
+  it("filters domains within an inclusive visitor date range", async () => {
+    await Promise.all(["before", "first", "last", "after"].map((id) => insertDomain(id, "2026-01-01T00:00:00.000Z")));
+    await recordVisit("before", "2026-08-09");
+    await recordVisit("first", "2026-08-10");
+    await recordVisit("last", "2026-08-11");
+    await recordVisit("after", "2026-08-12");
+
+    await expectDomains({ visitedFrom: "2026-08-10", visitedTo: "2026-08-11" }, ["first", "last"]);
+  });
+
+  it("requires one visit to satisfy both ends of a range", async () => {
+    await insertDomain("outside", "2026-01-01T00:00:00.000Z");
+    await recordVisit("outside", "2026-10-01");
+    await recordVisit("outside", "2026-10-09");
+    await expectDomains({ visitedFrom: "2026-10-05", visitedTo: "2026-10-07" }, []);
+    await expectDomains({ visitedFrom: "2026-10-05" }, ["outside"]);
+    await expectDomains({ visitedTo: "2026-10-07" }, ["outside"]);
+  });
+
+  it("applies presets and custom bounds to the same visit", async () => {
+    await insertDomain("mixed", "2026-01-01T00:00:00.000Z");
+    await recordVisit("mixed", today());
+    await recordVisit("mixed", daysAgo(10));
+    await expectDomains({ days: 7, visitedTo: daysAgo(5) }, []);
   });
 });

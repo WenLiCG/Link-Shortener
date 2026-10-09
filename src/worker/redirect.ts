@@ -1,5 +1,5 @@
 import { findDomainByHost, recordVisit } from "./db";
-import { buildTargetUrl, noRefererHtml, today } from "./shared";
+import { buildTargetUrl, noRefererRedirect, today } from "./shared";
 
 function firstLanguage(header: string | null): string | null {
   const value = header?.split(",")[0]?.split(";")[0]?.trim();
@@ -76,8 +76,16 @@ function isLikelyBotRequest(request: Request): boolean {
   if (botManagement?.verifiedBot === true) {
     return true;
   }
-  const ua = request.headers.get("user-agent")?.toLowerCase() ?? "";
-  return /bot|crawler|spider|slurp|bingpreview|facebookexternalhit|twitterbot|linkedinbot|discordbot|telegrambot|whatsapp|preview|monitor|uptime|pingdom/.test(ua);
+  const ua = request.headers.get("user-agent")?.trim().toLowerCase() ?? "";
+  return !ua || /bot|crawler|spider|slurp|bingpreview|facebookexternalhit|twitterbot|linkedinbot|discordbot|telegrambot|whatsapp|preview|monitor|uptime|pingdom|curl|wget|python-requests|go-http-client|headless|phantom|scanner/.test(ua);
+}
+
+const SCANNER_PATHS = new Set(["/.env", "/.git/config", "/wp-login.php", "/xmlrpc.php"]);
+const SCANNER_PREFIXES = ["/.git/", "/.aws/", "/.ssh/", "/vendor/"];
+
+function isScannerPath(pathname: string): boolean {
+  const path = pathname.toLowerCase();
+  return SCANNER_PATHS.has(path) || SCANNER_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 const IGNORED_PAGE_VIEW_PATHS = new Set([
@@ -132,6 +140,12 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
   if (!domain) {
     return new Response("Redirect domain is not configured.", { status: 404 });
   }
+  if (isScannerPath(url.pathname)) {
+    return new Response("Not found", { status: 404 });
+  }
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
+  }
   const userAgent = request.headers.get("user-agent");
   const client = clientFromUserAgent(userAgent);
   const targetUrl =
@@ -164,7 +178,7 @@ export async function handleRedirect(request: Request, env: Env, ctx: ExecutionC
     );
   }
   if (domain.hideReferer) {
-    return noRefererHtml(targetUrl);
+    return noRefererRedirect(targetUrl);
   }
   return Response.redirect(targetUrl, 302);
 }

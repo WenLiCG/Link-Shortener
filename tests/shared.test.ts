@@ -33,4 +33,13 @@ describe("domain helpers", () => {
     expect(html).toContain("<noscript><meta http-equiv=\"refresh\"");
     expect(html).not.toContain("<head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\"");
   });
+
+  it("keeps unnormalized script-closing text inside the redirect string", async () => {
+    const target = "https://example.com/#</script><script>alert(1)</script>";
+    const html = await noRefererHtml(target).text();
+    expect(html.match(/<script>/g)).toHaveLength(1);
+    expect(html.match(/<\/script>/g)).toHaveLength(1);
+    const serialized = html.match(/window\.location\.replace\((.*?)\);<\/script>/)?.[1];
+    expect(JSON.parse(serialized!)).toBe(target);
+  });
 });

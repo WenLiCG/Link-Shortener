@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { apiError } from "../src/worker/api";
-import { HttpError } from "../src/worker/http";
+import { HttpError, ok } from "../src/worker/http";
 
 describe("api errors", () => {
+  it("prevents browser and edge caching of API responses", () => {
+    expect(ok({}).headers.get("cache-control")).toBe("no-store");
+  });
+
   it("returns structured user-safe http errors", async () => {
     const response = apiError(new HttpError(400, "bad_request", "坏请求"));
     expect(response.status).toBe(400);

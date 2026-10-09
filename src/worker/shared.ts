@@ -15,6 +15,7 @@ export type RedirectMode = "target_service" | "target_service_forward" | "direct
 export type ApiErrorCode =
   | "bad_request"
   | "unauthorized"
+  | "session_expired"
   | "forbidden"
   | "rate_limited"
   | "not_found"
@@ -259,7 +260,7 @@ export function buildTargetUrl(targetHost: string): string {
 
 export function noRefererHtml(targetUrl: string): Response {
   const escaped = targetUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-  const scriptTarget = JSON.stringify(targetUrl);
+  const scriptTarget = JSON.stringify(targetUrl).replace(/</g, "\\u003c");
   return new Response(
     `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Redirecting</title></head><body><script>window.location.replace(${scriptTarget});</script><noscript><meta http-equiv="refresh" content="0;url=${escaped}"></noscript></body></html>`,
     {

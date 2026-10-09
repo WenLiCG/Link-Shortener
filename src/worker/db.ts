@@ -504,12 +504,15 @@ export interface DomainListFilters {
   groupId?: string;
   status?: string;
   days?: number;
+  visitedFrom?: string;
+  visitedTo?: string;
   includeHidden?: boolean;
 }
 
 export async function listDomains(db: D1Database, filters: DomainListFilters): Promise<RedirectDomain[]> {
   const clauses: string[] = [];
   const binds: unknown[] = [];
+  const visitClauses: string[] = [];
   if (!filters.includeHidden) {
     clauses.push("d.list_visible = 1");
   }
@@ -527,12 +530,23 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
   }
   if (filters.days !== undefined) {
     if (filters.days === 0 || filters.days === -1) {
-      clauses.push("date(d.created_at, '+8 hours') = date(?)");
+      visitClauses.push("v.day = ?");
       binds.push(daysAgo(-filters.days));
     } else if (filters.days > 0) {
-      clauses.push("date(d.created_at, '+8 hours') >= date(?)");
-      binds.push(daysAgo(filters.days - 1));
+      visitClauses.push("v.day BETWEEN ? AND ?");
+      binds.push(daysAgo(filters.days - 1), today());
     }
+  }
+  if (filters.visitedFrom) {
+    visitClauses.push("v.day >= ?");
+    binds.push(filters.visitedFrom);
+  }
+  if (filters.visitedTo) {
+    visitClauses.push("v.day <= ?");
+    binds.push(filters.visitedTo);
+  }
+  if (visitClauses.length > 0) {
+    clauses.push(`EXISTS (SELECT 1 FROM traffic_daily_visitors v WHERE v.subject_type = 'redirect_domain' AND v.subject_id = d.id AND ${visitClauses.join(" AND ")})`);
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   return (
@@ -561,11 +575,13 @@ export async function listDomains(db: D1Database, filters: DomainListFilters): P
 
 export async function findDomainByHost(db: D1Database, host: string): Promise<RedirectDomain | null> {
   const labels = host.toLowerCase().split(".");
-  for (let index = 0; index <= labels.length - 2; index += 1) {
-    const candidate = labels.slice(index).join(".");
-    const row = await first(
-      db,
-      `SELECT d.*, CASE WHEN d.redirect_mode = 'direct' THEN d.direct_target_host ELSE COALESCE(t.target_host, d.deleted_target_host, '') END AS target_host,
+  const candidates = labels.map((_, index) => labels.slice(index).join(".")).slice(0, -1);
+  if (candidates.length === 0) {
+    return null;
+  }
+  const row = await first(
+    db,
+    `SELECT d.*, CASE WHEN d.redirect_mode = 'direct' THEN d.direct_target_host ELSE COALESCE(t.target_host, d.deleted_target_host, '') END AS target_host,
         CASE
           WHEN d.redirect_mode = 'direct' THEN '直接跳转'
           WHEN d.target_service_id IS NULL AND d.deleted_target_host IS NOT NULL THEN '目标服务已删除'
@@ -576,23 +592,28 @@ export async function findDomainByHost(db: D1Database, host: string): Promise<Re
        FROM redirect_domains d
        LEFT JOIN target_services t ON t.id = d.target_service_id
        LEFT JOIN groups g ON g.id = d.group_id
-       WHERE d.domain = ? AND d.list_visible = 1 AND d.status IN ('active', 'route_configured', 'waiting_nameserver')
+       WHERE d.domain IN (SELECT value FROM json_each(?))
+         AND d.list_visible = 1 AND d.status IN ('active', 'route_configured', 'waiting_nameserver')
+       ORDER BY length(d.domain) DESC
        LIMIT 1`,
-      candidate,
-    );
-    if (row) {
-      return mapDomain(row);
-    }
-  }
-  return null;
+    JSON.stringify(candidates),
+  );
+  return row ? mapDomain(row) : null;
 }
 
 export async function getDomainDetail(db: D1Database, id: string): Promise<DomainDetail | null> {
-  const rows = await listDomains(db, { includeHidden: true });
-  const domain = rows.find((item) => item.id === id);
+  const domain = await getDomainById(db, id);
   if (!domain) {
     return null;
   }
+  const traffic = await first(
+    db,
+    `SELECT COUNT(*) AS total, MAX(first_seen_at) AS last_accessed_at
+     FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND subject_id = ?`,
+    id,
+  );
+  domain.traffic = numberValue(traffic?.total ?? 0);
+  domain.lastAccessedAt = optionalText(traffic?.last_accessed_at ?? null);
   const jobRows = await all(db, "SELECT * FROM domain_jobs WHERE redirect_domain_id = ? ORDER BY created_at DESC", id);
   const stepRows = await all(
     db,
@@ -764,7 +785,7 @@ export async function getDomainDetail(db: D1Database, id: string): Promise<Domai
       id,
     )
   ).map((row) => ({
-    id: text(row.id),
+    id: String(row.id),
     host: domain.domain,
     path: "/",
     referer: optionalText(row.referer_host),
@@ -831,14 +852,14 @@ export async function createRedirectDomain(
        VALUES (?, ?, 'domain_provision', 'redirect_domain', ?, '{}', ?)`,
     ).bind(jobId, id, id, `domain_provision:${id}`),
   ]);
-  const detail = await getDomainDetail(db, id);
-  if (!detail) {
+  const domain = await getDomainById(db, id);
+  if (!domain) {
     throw new Error("domain_insert_failed");
   }
-  return { domain: detail, jobId };
+  return { domain, jobId };
 }
 
-export async function getDomainForAutomation(db: D1Database, id: string): Promise<RedirectDomain | null> {
+export async function getDomainById(db: D1Database, id: string): Promise<RedirectDomain | null> {
   const row = await first(
     db,
     `SELECT d.*, CASE WHEN d.redirect_mode = 'direct' THEN d.direct_target_host ELSE COALESCE(t.target_host, d.deleted_target_host, '') END AS target_host,
@@ -878,10 +899,10 @@ export async function findDomainByName(db: D1Database, domain: string): Promise<
   return row ? mapDomain(row) : null;
 }
 
-export async function findDomainForwardTarget(db: D1Database, id: string, targetHost: string): Promise<string | null> {
+export async function findDomainForwardTarget(db: D1Database, id: string, targetHost: string): Promise<{ targetHost: string; hideReferer: boolean } | null> {
   const row = await first(
     db,
-    `SELECT d.target_forward_host
+    `SELECT d.target_forward_host, d.hide_referer
      FROM redirect_domains d
      JOIN target_services t ON t.id = d.target_service_id
      WHERE d.id = ?
@@ -894,7 +915,8 @@ export async function findDomainForwardTarget(db: D1Database, id: string, target
     id,
     targetHost.toLowerCase(),
   );
-  return optionalText(row?.target_forward_host ?? null);
+  const forwardHost = optionalText(row?.target_forward_host ?? null);
+  return row && forwardHost ? { targetHost: forwardHost, hideReferer: bool(row.hide_referer) } : null;
 }
 
 export async function addJobStep(
@@ -950,7 +972,10 @@ export async function updateDomainAutomation(
   for (const [key, column] of Object.entries(mapping)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
-      assignments.push(`${column} = ?`);
+      // A configuration retry must not take an already serving domain offline.
+      assignments.push(key === "status" || key === "listVisible"
+        ? `${column} = CASE WHEN status = 'active' AND list_visible = 1 THEN ${column} ELSE ? END`
+        : `${column} = ?`);
       binds.push(typeof value === "boolean" ? (value ? 1 : 0) : Array.isArray(value) ? JSON.stringify(value) : value);
     }
   }
@@ -965,13 +990,19 @@ export async function retryDomain(
   idempotencyKey: string,
 ): Promise<{ id: string; status: JobStatus }> {
   const jobId = crypto.randomUUID();
-  await db.batch([
+  const results = await db.batch<{ id: string; status: JobStatus }>([
     db.prepare(
       `INSERT INTO domain_jobs
        (id, redirect_domain_id, type, subject_type, subject_id, payload, idempotency_key)
-       VALUES (?, ?, 'domain_retry', 'redirect_domain', ?, '{}', ?)
+       SELECT ?, ?, 'domain_retry', 'redirect_domain', ?, '{}', ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM domain_jobs
+         WHERE subject_type = 'redirect_domain' AND subject_id = ?
+           AND type IN ('domain_provision', 'domain_retry')
+           AND status IN ('queued', 'running', 'retry_wait')
+       )
        ON CONFLICT(idempotency_key) DO NOTHING`,
-    ).bind(jobId, id, id, idempotencyKey),
+    ).bind(jobId, id, id, idempotencyKey, id),
     db
       .prepare(
         `UPDATE redirect_domains
@@ -979,14 +1010,21 @@ export async function retryDomain(
              last_error = NULL,
              list_visible = 0,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?`,
+         WHERE id = ? AND NOT (status = 'active' AND list_visible = 1)
+           AND EXISTS (SELECT 1 FROM domain_jobs WHERE id = ?)`,
       )
-      .bind(id),
+      .bind(id, jobId),
+    db.prepare(
+      `SELECT id, status FROM domain_jobs
+       WHERE (subject_type = 'redirect_domain' AND subject_id = ?
+         AND type IN ('domain_provision', 'domain_retry')
+         AND status IN ('queued', 'running', 'retry_wait'))
+         OR idempotency_key = ?
+       ORDER BY CASE WHEN status IN ('queued', 'running', 'retry_wait') THEN 0 ELSE 1 END, created_at DESC
+       LIMIT 1`,
+    ).bind(id, idempotencyKey),
   ]);
-  const row = await db
-    .prepare("SELECT id, status FROM domain_jobs WHERE idempotency_key = ?")
-    .bind(idempotencyKey)
-    .first<{ id: string; status: JobStatus }>();
+  const row = results[2].results[0];
   if (!row) {
     throw new Error("job_enqueue_failed");
   }
@@ -1039,11 +1077,23 @@ export async function summaryStats(db: D1Database): Promise<SummaryStats> {
        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
        SUM(CASE WHEN status = 'waiting_nameserver' THEN 1 ELSE 0 END) AS waiting
-     FROM redirect_domains
-     WHERE list_visible = 1`,
+     FROM redirect_domains`,
   );
-  const visits = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain'");
-  const visitsToday = await first(db, "SELECT COUNT(*) AS visits FROM traffic_daily_visitors WHERE subject_type = 'redirect_domain' AND day = ?", today());
+  const visits = await first(
+    db,
+    `SELECT COUNT(*) AS visits
+     FROM traffic_daily_visitors v
+     JOIN redirect_domains d ON d.id = v.subject_id
+     WHERE v.subject_type = 'redirect_domain' AND d.list_visible = 1 AND d.status = 'active'`,
+  );
+  const visitsToday = await first(
+    db,
+    `SELECT COUNT(*) AS visits
+     FROM traffic_daily_visitors v
+     JOIN redirect_domains d ON d.id = v.subject_id
+     WHERE v.subject_type = 'redirect_domain' AND d.list_visible = 1 AND d.status = 'active' AND v.day = ?`,
+    today(),
+  );
   return {
     totalDomains: numberValue(domainStats?.total ?? 0),
     activeDomains: numberValue(domainStats?.active ?? 0),
@@ -1097,6 +1147,7 @@ export async function getJobById(db: D1Database, id: string): Promise<DomainJob 
 }
 
 export async function claimNextJob(db: D1Database, leaseSeconds = 600): Promise<DomainJob | null> {
+  // shortcut: one global lease serializes provider changes; use per-subject leases if sustained backlog requires concurrency.
   const now = new Date().toISOString();
   const leaseToken = crypto.randomUUID();
   const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
@@ -1179,11 +1230,34 @@ export async function recordJobFailure(
   const delaySeconds = nameserverPending
     ? 300
     : Math.min(3600, 30 * 2 ** Math.max(0, job.attemptCount - 1));
-  const message = error instanceof ProviderError ? error.message : "任务执行失败。";
-  await db
-    .prepare(
+  const message = nameserverPending && !retryable
+    ? "Nameserver 在 48 小时内未生效，请检查注册商设置后重试。"
+    : error instanceof ProviderError ? error.message : "任务执行失败。";
+  const statements: D1PreparedStatement[] = [];
+  if (nameserverPending && !retryable) {
+    if (job.redirectDomainId) {
+      statements.push(db.prepare(
+        `UPDATE redirect_domains
+         SET status = CASE WHEN status = 'active' AND list_visible = 1 THEN status ELSE 'failed' END,
+             last_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? AND EXISTS (
+           SELECT 1 FROM domain_jobs WHERE id = ? AND status = 'running' AND lease_token = ?
+         )`,
+      ).bind(message, job.redirectDomainId, jobId, leaseToken));
+    } else if (job.type === "target_repair") {
+      statements.push(db.prepare(
+        `UPDATE target_services SET automation_status = 'failed', last_error = ?,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? AND EXISTS (
+           SELECT 1 FROM domain_jobs WHERE id = ? AND status = 'running' AND lease_token = ?
+         )`,
+      ).bind(message, job.subjectId, jobId, leaseToken));
+    }
+  }
+  statements.push(db.prepare(
       `UPDATE domain_jobs
        SET status = ?, error_message = ?, next_attempt_at = ?,
+           current_step = CASE WHEN ? THEN 'waiting_nameserver' ELSE current_step END,
            lease_token = NULL, lease_expires_at = NULL,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
            finished_at = CASE WHEN ? = 'failed' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END
@@ -1193,18 +1267,17 @@ export async function recordJobFailure(
       status,
       message,
       new Date(Date.now() + delaySeconds * 1000).toISOString(),
+      nameserverPending ? 1 : 0,
       status,
       jobId,
       leaseToken,
-    )
-    .run();
+    ));
+  await db.batch(statements);
   return status;
 }
 
 export async function cleanupVisits(db: D1Database, retentionDays: number): Promise<void> {
-  const cutoff = daysAgo(retentionDays);
-  await db.batch([
-    db.prepare("DELETE FROM visit_events WHERE date(visited_at) < date(?)").bind(cutoff),
-    db.prepare("DELETE FROM traffic_daily_visitors WHERE day < ?").bind(cutoff),
-  ]);
+  const days = Number.isInteger(retentionDays) && retentionDays > 0 ? retentionDays : 30;
+  const cutoff = daysAgo(days - 1);
+  await db.prepare("DELETE FROM traffic_daily_visitors WHERE day < ?").bind(cutoff).run();
 }

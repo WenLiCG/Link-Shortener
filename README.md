@@ -12,7 +12,7 @@ A Cloudflare-native redirect management app for operating many entry domains fro
 - Cloudflare NS intake tool for domains from any registrar.
 - Cloudflare Zone deletion helper.
 - Short link generation on configured target service domains.
-- Traffic uses one privacy-safe IP hash per domain or short link per Shanghai calendar day; duplicate page requests add request volume but not UV.
+- Traffic uses one privacy-safe IP hash per domain or short link per Shanghai calendar day. Duplicate requests do not add UV; PV/request volume is not recorded.
 - Frontend-driven one-at-a-time batch processing to avoid Cloudflare Worker subrequest limits.
 
 ## Security Notice
@@ -72,10 +72,12 @@ Create local secrets:
 cp .dev.vars.example .dev.vars
 ```
 
-Generate an admin password hash:
+Generate an admin bootstrap password hash in PowerShell 7 (password input is masked):
 
-```bash
-node -e "crypto.subtle.digest('SHA-256', new TextEncoder().encode('your-password')).then(b=>console.log([...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')))"
+```powershell
+$bootstrapPassword = Read-Host "New admin password" -AsSecureString
+[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes([Net.NetworkCredential]::new('', $bootstrapPassword).Password))).ToLowerInvariant()
+Remove-Variable bootstrapPassword
 ```
 
 This SHA-256 value is accepted only as a one-time bootstrap format when `PASSWORD_PEPPER` is configured. The first successful login replaces it in D1 with a salted PBKDF2 hash.
@@ -129,7 +131,7 @@ npx wrangler d1 migrations apply multi-domain-redirect-manager --local
 
 For an existing deployment, first create the ignored deployment-only `.wrangler/deploy.jsonc` with the real D1 database ID, `ADMIN_HOST`, and custom-domain route. Configure the production secrets above, then build and dry-run the exact artifact you will deploy.
 
-An existing deployment requires a coordinated maintenance window. Migration `0018` rebuilds the job queue: the old Worker cannot write its new required columns, while the current Worker cannot use the old queue schema. Do not use a live “deploy then migrate” or “migrate then deploy” sequence.
+An existing deployment not yet migrated through `0021` requires a coordinated maintenance window. Migration `0018` rebuilds the job queue: the old Worker cannot write its new required columns, while the current Worker cannot use the old queue schema. Do not use a live “deploy then migrate” or “migrate then deploy” sequence for these older schemas. Upgrading from `0021` uses the separate `0022` procedure below.
 
 1. Identify the active Worker deployment and record its version ID (`npx wrangler deployments list --config .wrangler/deploy.jsonc`). Export D1 and record a Time Travel bookmark immediately before the window:
 
@@ -151,6 +153,28 @@ npm run deploy -- --config .wrangler/deploy.jsonc
 If migration or deployment verification fails, keep traffic paused, run `npx wrangler rollback <previous-version-id> --config .wrangler/deploy.jsonc`, restore D1 to the saved pre-window bookmark with `npx wrangler d1 time-travel restore multi-domain-redirect-manager --config .wrangler/deploy.jsonc --bookmark <bookmark>`, verify the old Worker against the restored schema, then reopen traffic. The SQL export is the additional offline backup; do not import it over a partially migrated database.
 
 Migration `0017` removes legacy provider credentials from D1, so its Wrangler Secrets must exist before the window. Migration `0019` adds the daily visitor facts table without raw IP addresses; migration `0021` corrects its historical rows to Shanghai calendar days and restores the cleanup index.
+
+### Removing legacy traffic tables (`0022`)
+
+Migration `0022` drops the unused `visit_events`, `visit_daily_stats`, and `traffic_daily_stats` tables. The current `traffic_daily_visitors` facts and their UV counts are preserved. Legacy PV and raw event detail are not preserved in the live database; export D1 and keep the export before applying this migration. The two legacy `visit_daily_uniques` and `short_link_daily_uniques` tables remain as historical archives because their complete UV history was never migrated. The app does not read or write these archives, and they are not merged into current counts to avoid incompatible visitor keys or day boundaries producing duplicate UV.
+
+For an installation already migrated through `0021`, deploy this release first, verify redirects and the scheduled cleanup, and then apply `0022`. This release works both before and after that cleanup. The previous Worker still queries `visit_events` in its cron and must not run after `0022`. Returning to that previous Worker requires restoring the matching database backup as well. Installations not yet at `0021` must use the coordinated maintenance procedure above.
+
+### Traffic retention
+
+`VISIT_EVENT_RETENTION_DAYS` is a positive whole number, defaulting to 30. Cleanup retains today and the preceding N−1 Shanghai calendar days. Invalid values fall back to 30. Displayed totals sum daily UV within the retained data; a visitor returning on another day counts again. They are neither lifetime traffic nor visitors deduplicated across the entire period. Cleanup can reduce these totals. The global domain counts include waiting and failed domains; traffic in the global summary includes only visible active entry domains.
+
+### Recovering the admin password
+
+After the first successful login, the salted password hash in D1 takes precedence over the bootstrap `ADMIN_PASSWORD_HASH` Secret. Changing only that Secret does not reset an existing password.
+
+With the Cloudflare account owner credential, back up D1, generate a new bootstrap hash using the local setup instructions, and set it using `wrangler secret put ADMIN_PASSWORD_HASH --config .wrangler/deploy.jsonc`. Ensure `PASSWORD_PEPPER` is configured. Then remove only the stored password override:
+
+```bash
+npx wrangler d1 execute multi-domain-redirect-manager --remote --config .wrangler/deploy.jsonc --command "DELETE FROM settings WHERE key = 'ADMIN_PASSWORD_HASH'"
+```
+
+Log in with the new password to replace the bootstrap hash with PBKDF2 again. Existing sessions cease to validate against the changed password. Do not place passwords or secret values in source files or CLI arguments.
 
 ## Cloudflare API Token Permissions
 
@@ -193,7 +217,7 @@ After deployment:
 - Entry-domain request path/query is not preserved.
 - Direct redirects can point to any HTTP/HTTPS URL, including path/query.
 - Target-service two-step redirects can also end at any HTTP/HTTPS URL.
-- Optional no-referrer mode returns an HTML intermediate page with `Referrer-Policy: no-referrer`. This reduces referer leakage but does not guarantee complete anonymity.
+- Entry-domain no-referrer mode uses HTTP 302 with `Referrer-Policy: no-referrer`; both hops of a target-service forward respect the entry domain's setting. Short links use an HTML intermediate page when their own no-referrer option is enabled. These controls reduce referer leakage but do not guarantee anonymity.
 
 ## Batch Operation Model
 
@@ -204,7 +228,11 @@ Cloudflare Workers have subrequest limits per Worker invocation. To reduce failu
 - Cloudflare Zone deletion one domain at a time.
 - Multi-select deletion one id at a time.
 
-Failed or timed-out items stay visible in the result panel with a manual retry button.
+Accepted operations keep their task IDs. Waiting for nameservers, a browser timeout, or a temporary network error does not mean the backend task failed; the UI continues checking known task IDs. If a page reload or lost response leaves no task ID, the result is marked unconfirmed and can be retried. NS and Zone tools reuse the saved request key for unconfirmed submissions. Only a completed task is reported as successful, and an explicitly failed task can be retried. Reconfiguring an already active entry domain keeps its existing redirect available while the task records progress or errors.
+
+The backend retains a single leased job across requests, browser tabs, and cron. A nameserver retry releases its lease while waiting, so other jobs can proceed. Automatic activation checks reuse completed configuration instead of resubmitting NS/DNS/routes. New explicit repairs still verify the configuration. The cron is a fallback; task submissions and status queries also wake the queue.
+
+Deleting entry domains removes only this application's configuration. The separate Zone deletion tool refuses to delete a Zone still used by the admin host, a target service, or an entry domain, including subdomains. Remove or relocate those dependencies explicitly first.
 
 ## Public Repository Checklist
 

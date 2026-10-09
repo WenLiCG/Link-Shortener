@@ -43,11 +43,12 @@ export async function handleTargetService(request: Request, env: Env, ctx: Execu
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("Method not allowed", { status: 405 });
     }
-    const forwardHost = await findDomainForwardTarget(env.DB, forwardMatch[1], target.targetHost);
-    if (!forwardHost) {
+    const forward = await findDomainForwardTarget(env.DB, forwardMatch[1], target.targetHost);
+    if (!forward) {
       return new Response("Forward target is not configured.", { status: 404 });
     }
-    return noRefererRedirect(buildTargetUrl(forwardHost));
+    const targetUrl = buildTargetUrl(forward.targetHost);
+    return forward.hideReferer ? noRefererRedirect(targetUrl) : Response.redirect(targetUrl, 302);
   }
   const shortCodeMatch = url.pathname.match(/^\/([A-Za-z0-9_-]{3,32})\/?$/);
   if (shortCodeMatch) {

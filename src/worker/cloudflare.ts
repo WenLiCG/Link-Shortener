@@ -1,5 +1,6 @@
 import { secret } from "./env-utils";
 import { ProviderError } from "./provider-error";
+import { domainMatchesHost } from "./shared";
 
 export interface CloudflareZone {
   id: string;
@@ -303,6 +304,20 @@ export async function deleteZoneByName(env: Env, domain: string): Promise<{ dele
   const zone = existing.find((item) => item.name === domain);
   if (!zone) {
     return { deleted: false, status: "not_found", message: "Cloudflare 中未找到同名 Zone。" };
+  }
+  if (domainMatchesHost(zone.name, env.ADMIN_HOST || "")) {
+    throw new ProviderError("cloudflare", 409, "zone_in_use", false, "该 Zone 承载管理后台，不能删除。");
+  }
+  const dependency = await env.DB.prepare(
+    `SELECT domain AS host FROM redirect_domains
+     WHERE cloudflare_zone_id = ? OR lower(domain) = ? OR substr(lower(domain), -length(?)) = ?
+     UNION ALL
+     SELECT target_host AS host FROM target_services
+     WHERE cloudflare_zone_id = ? OR lower(target_host) = ? OR substr(lower(target_host), -length(?)) = ?
+     LIMIT 1`,
+  ).bind(zone.id, zone.name, `.${zone.name}`, `.${zone.name}`, zone.id, zone.name, `.${zone.name}`, `.${zone.name}`).first<{ host: string }>();
+  if (dependency) {
+    throw new ProviderError("cloudflare", 409, "zone_in_use", false, `该 Zone 仍被 ${dependency.host} 使用，请先移除相关系统配置。`);
   }
   await cfRequest(env, `/zones/${zone.id}`, { method: "DELETE" });
   return { deleted: true, zoneId: zone.id, status: "deleted", message: "已删除 Cloudflare Zone。" };

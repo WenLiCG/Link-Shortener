@@ -192,7 +192,7 @@ describe("durable job queue", () => {
       "SELECT automation_status, nameserver_status FROM target_services WHERE id = ?",
     ).bind(created.target.id).first()).resolves.toMatchObject({
       automation_status: "waiting_nameserver",
-      nameserver_status: "waiting",
+      nameserver_status: testEnv.DYNADOT_API_KEY ? "manual_required" : "skipped_missing_key",
     });
   });
 

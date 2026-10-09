@@ -31,7 +31,7 @@ async function sign(secretValue: string, payload: string): Promise<string> {
 async function verifySignature(secretValue: string, payload: string, signature: string): Promise<boolean> {
   try {
     const key = await importHmacKey(secretValue, ["verify"]);
-    return crypto.subtle.verify("HMAC", key, base64UrlDecode(signature), encoder.encode(payload));
+    return await crypto.subtle.verify("HMAC", key, base64UrlDecode(signature), encoder.encode(payload));
   } catch {
     return false;
   }
@@ -134,11 +134,11 @@ export async function requireSession(request: Request, env: Env): Promise<void> 
   const token = getCookie(request, SESSION_COOKIE);
   const sessionSecret = secret(env, "SESSION_SECRET");
   if (!token || !sessionSecret) {
-    throw new HttpError(401, "unauthorized", "请先登录。");
+    throw new HttpError(401, "session_expired", "请先登录。");
   }
   const [payload, signature, extra] = token.split(".");
   if (!payload || !signature || extra || !(await verifySignature(sessionSecret, payload, signature))) {
-    throw new HttpError(401, "unauthorized", "登录状态无效。");
+    throw new HttpError(401, "session_expired", "登录状态无效。");
   }
   let body: { sub?: string; exp?: number; passwordVersion?: string };
   try {
@@ -148,15 +148,15 @@ export async function requireSession(request: Request, env: Env): Promise<void> 
       passwordVersion?: string;
     };
   } catch {
-    throw new HttpError(401, "unauthorized", "登录状态无效。");
+    throw new HttpError(401, "session_expired", "登录状态无效。");
   }
   if (
     body.sub !== "admin" ||
     !body.exp ||
-    body.exp < Math.floor(Date.now() / 1000) ||
+    body.exp <= Math.floor(Date.now() / 1000) ||
     body.passwordVersion !== await passwordVersion(env, sessionSecret)
   ) {
-    throw new HttpError(401, "unauthorized", "登录已过期。");
+    throw new HttpError(401, "session_expired", "登录已过期。");
   }
 }
 
@@ -201,7 +201,7 @@ export async function recordLoginFailure(request: Request, env: Env): Promise<vo
   const initial = JSON.stringify({ count: 1, firstAt: now, blockedUntil: 0 } satisfies LoginFailure);
   await env.DB.batch([
     env.DB.prepare(
-      "DELETE FROM settings WHERE key LIKE 'login_fail:%' AND updated_at < datetime('now', '-1 day')",
+      "DELETE FROM settings WHERE key LIKE 'login_fail:%' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')",
     ),
     env.DB.prepare(
       `INSERT INTO settings (key, value, updated_at)

@@ -29,11 +29,21 @@ import {
 } from "lucide-react";
 import { runSerialBatch } from "./batch";
 import { useOperationPolling } from "./hooks/useOperationPolling";
-import { api, ApiError, sessionEvents, waitForOperation, operationResult, operationState, isOperationPending, isProcessingStatus, pollingFailure, restoreOperationResults, submissionFailureStatus, retryRequestKey, visibleSelection, formatDate, REQUEST_TIMEOUT_MS, DOMAIN_POLL_INTERVAL_MS, type OperationJob } from "./operations";
+import { api, ApiError, sessionEvents, operationResult, operationState, isOperationPending, isProcessingStatus, pollingFailure, restoreOperationResults, submissionFailureStatus, retryRequestKey, visibleSelection, retainedDateRange, formatDate, REQUEST_TIMEOUT_MS, DOMAIN_POLL_INTERVAL_MS, type OperationJob } from "./operations";
 import "./styles.css";
 
 type View = "domains" | "add" | "nameservers" | "cloudflare-delete" | "registrars" | "short-links" | "targets" | "detail" | "settings";
 type RedirectMode = "target_service" | "target_service_forward" | "direct";
+
+interface DomainFilters {
+  search: string;
+  groupId: string;
+  status: string;
+  days: string;
+  visitedFrom: string;
+  visitedTo: string;
+  includeHidden: boolean;
+}
 
 interface TargetService {
   id: string;
@@ -755,17 +765,22 @@ function App() {
   const [registrars, setRegistrars] = useState<RegistrarStatus | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [filters, setFilters] = useState({ search: "", groupId: "", status: "", days: "", visitedFrom: "", visitedTo: "" });
+  const [filters, setFilters] = useState<DomainFilters>({ search: "", groupId: "", status: "", days: "", visitedFrom: "", visitedTo: "", includeHidden: false });
   const loadSequence = useRef(0);
   const filtersRef = useRef(filters);
   filtersRef.current = filters;
 
-  async function loadAll() {
+  async function loadAll(requestedFilters = filtersRef.current) {
     const sequence = ++loadSequence.current;
-    const filters = filtersRef.current;
+    const filters = requestedFilters;
     setLoading(true);
     setError("");
     try {
+      const range = retainedDateRange(settings?.visitEventRetentionDays ?? 30);
+      if (Number(filters.days) > range.days || (filters.days === "-1" && range.days < 2) ||
+          [filters.visitedFrom, filters.visitedTo].some((date) => date && (date < range.from || date > range.to))) {
+        throw new Error(`当前仅能查询 ${range.from} 至 ${range.to} 的保留记录。`);
+      }
       const params = new URLSearchParams();
       if (filters.search) params.set("search", filters.search);
       if (filters.groupId) params.set("groupId", filters.groupId);
@@ -773,6 +788,7 @@ function App() {
       if (filters.days) params.set("days", filters.days);
       if (filters.visitedFrom) params.set("visitedFrom", filters.visitedFrom);
       if (filters.visitedTo) params.set("visitedTo", filters.visitedTo);
+      if (filters.includeHidden) params.set("includeHidden", "true");
       const [domainData, targetData, shortLinkData, groupData, summaryData, settingsData, registrarData] = await Promise.all([
         api<RedirectDomain[]>(`/api/domains?${params.toString()}`),
         api<TargetService[]>("/api/targets"),
@@ -818,7 +834,7 @@ function App() {
     if (authenticated) {
       void loadAll();
     }
-  }, [authenticated, filters.groupId, filters.status, filters.days, filters.visitedFrom, filters.visitedTo]);
+  }, [authenticated, filters.groupId, filters.status, filters.days, filters.visitedFrom, filters.visitedTo, filters.includeHidden]);
 
   if (authenticated === null) {
     return (
@@ -923,6 +939,7 @@ function App() {
             domains={domains}
             groups={groups}
             summary={summary}
+            retentionDays={settings?.visitEventRetentionDays ?? 30}
             filters={filters}
             setFilters={setFilters}
             onSearch={loadAll}
@@ -935,7 +952,7 @@ function App() {
         {view === "cloudflare-delete" && <CloudflareZoneDeleteView />}
         {view === "registrars" && <RegistrarsView registrars={registrars} onUpdated={loadAll} />}
         {view === "short-links" && <ShortLinksView targets={targets} shortLinks={shortLinks} onUpdated={loadAll} />}
-        {view === "targets" && <TargetsViewV2 targets={targets} onCreated={loadAll} />}
+        {view === "targets" && <TargetsViewV2 targets={targets} workerScriptName={settings?.workerScriptName} onCreated={loadAll} />}
         {view === "settings" && <SettingsView settings={settings} onUpdated={loadAll} onLogout={logout} />}
         {view === "detail" && selectedDomainId && <DetailView id={selectedDomainId} onBack={() => setView("domains")} onUpdated={loadAll} />}
       </main>
@@ -947,6 +964,7 @@ function DomainsView({
   domains,
   groups,
   summary,
+  retentionDays,
   filters,
   setFilters,
   onSearch,
@@ -956,9 +974,10 @@ function DomainsView({
   domains: RedirectDomain[];
   groups: DomainGroup[];
   summary: SummaryStats | null;
-  filters: { search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string };
-  setFilters: React.Dispatch<React.SetStateAction<{ search: string; groupId: string; status: string; days: string; visitedFrom: string; visitedTo: string }>>;
-  onSearch: () => Promise<void>;
+  retentionDays: number;
+  filters: DomainFilters;
+  setFilters: React.Dispatch<React.SetStateAction<DomainFilters>>;
+  onSearch: (filters?: DomainFilters) => Promise<void>;
   onOpen: (id: string) => void;
   onDeleted: () => Promise<void>;
 }) {
@@ -968,6 +987,13 @@ function DomainsView({
   const [message, setMessage] = useState("");
   const [pendingJobs, setPendingJobs] = useState<string[]>([]);
   const visibleSelected = visibleSelection(domains, selected);
+  const retainedRange = retainedDateRange(retentionDays);
+
+  function showStatus(status: string) {
+    const next = { search: "", groupId: "", status, days: "", visitedFrom: "", visitedTo: "", includeHidden: true };
+    setFilters(next);
+    if (filters.status === status && filters.includeHidden && !filters.groupId && !filters.days && !filters.visitedFrom && !filters.visitedTo) void onSearch(next);
+  }
 
   useEffect(() => { setSelected((current) => visibleSelection(domains, current)); }, [domains]);
 
@@ -978,18 +1004,15 @@ function DomainsView({
       setMessage(operationState(job).message);
       await onDeleted();
     }
+    return job;
   }, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     setMessage(pollingFailure(error).message);
     if (error instanceof ApiError && error.status === 404) setPendingJobs((current) => current.filter((id) => id !== jobId));
   });
 
-  async function followJob(jobId: string) {
-    const job = await waitForOperation(jobId);
-    if (!operationState(job).ok) throw new Error(operationState(job).message);
-    if (isOperationPending(job)) {
-      setPendingJobs((current) => [...new Set([...current, jobId])]);
-      setMessage(operationState(job).message);
-    }
+  function trackJob(jobId: string) {
+    setPendingJobs((current) => [...new Set([...current, jobId])]);
+    setMessage("任务已加入后台队列，将自动更新结果。");
   }
 
   async function deleteSelected() {
@@ -1008,7 +1031,7 @@ function DomainsView({
             headers: { "idempotency-key": crypto.randomUUID() },
             body: JSON.stringify({ ids: [id] }),
           });
-          await followJob(queued.jobId);
+          trackJob(queued.jobId);
           return id;
         },
         (id, outcome) => {
@@ -1038,7 +1061,7 @@ function DomainsView({
         headers: { "idempotency-key": crypto.randomUUID() },
         body: JSON.stringify({}),
       });
-      await followJob(queued.jobId);
+      trackJob(queued.jobId);
       await onDeleted();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "重新配置失败。");
@@ -1053,10 +1076,11 @@ function DomainsView({
         <Metric icon={<Globe2 />} label="域名总数" value={summary?.totalDomains ?? 0} />
         <Metric icon={<CheckCircle2 />} label="可用域名" value={summary?.activeDomains ?? 0} />
         <Metric icon={<Activity />} label="今日候选 UV" value={summary?.visitsToday ?? 0} />
-        <Metric icon={<AlertTriangle />} label="失败 / 等待" value={`${summary?.failedDomains ?? 0} / ${summary?.waitingDomains ?? 0}`} />
+        <Metric icon={<AlertTriangle />} label="失败 / 等待" value={<><button className="ghost" type="button" onClick={() => showStatus("failed")} aria-label="查看全部失败域名">{summary?.failedDomains ?? 0}</button> / <button className="ghost" type="button" onClick={() => showStatus("waiting_nameserver")} aria-label="查看全部等待生效域名">{summary?.waitingDomains ?? 0}</button></>} />
       </section>
       <div className="explain-note">
         域名总数、可用域名、失败 / 等待是系统内全量入口域名统计；今日候选 UV 按入口域名、客户端 IP 和上海自然日去重，不等同于停放平台认可访问。下方列表会受搜索、状态、Group 和时间筛选影响。
+        访问记录最长保留 {retainedRange.days} 天（当前可查询 {retainedRange.from} 至 {retainedRange.to}），已清理的数据无法恢复。
       </div>
       <section className="toolbar">
         <div className="searchbox">
@@ -1080,21 +1104,23 @@ function DomainsView({
           <option value="waiting_nameserver">等待生效</option>
           <option value="failed">失败</option>
         </select>
+        <label className="switch"><input type="checkbox" checked={filters.includeHidden} onChange={(event) => setFilters((current) => ({ ...current, includeHidden: event.target.checked }))} /><span>显示未完成配置</span></label>
         <select value={filters.days} onChange={(event) => setFilters((current) => ({ ...current, days: event.target.value, visitedFrom: "", visitedTo: "" }))}>
           <option value="">全部时间</option>
           <option value="0">今天</option>
-          <option value="-1">昨天</option>
-          <option value="7">过去 7 天</option>
-          <option value="30">过去一个月</option>
-          <option value="90">过去三个月</option>
-          <option value="180">过去半年</option>
-          <option value="365">过去一年</option>
+          {retainedRange.days >= 2 && <option value="-1">昨天</option>}
+          {retainedRange.days >= 7 && <option value="7">过去 7 天</option>}
+          {retainedRange.days >= 30 && <option value="30">过去一个月</option>}
+          {retainedRange.days >= 90 && <option value="90">过去三个月</option>}
+          {retainedRange.days >= 180 && <option value="180">过去半年</option>}
+          {retainedRange.days >= 365 && <option value="365">过去一年</option>}
         </select>
         <input
           aria-label="开始日期"
           type="date"
           value={filters.visitedFrom}
-          max={filters.visitedTo || undefined}
+          min={retainedRange.from}
+          max={filters.visitedTo || retainedRange.to}
           onChange={(event) => setFilters((current) => ({ ...current, days: "", visitedFrom: event.target.value }))}
         />
         <span>至</span>
@@ -1102,7 +1128,8 @@ function DomainsView({
           aria-label="结束日期"
           type="date"
           value={filters.visitedTo}
-          min={filters.visitedFrom || undefined}
+          min={filters.visitedFrom || retainedRange.from}
+          max={retainedRange.to}
           onChange={(event) => setFilters((current) => ({ ...current, days: "", visitedTo: event.target.value }))}
         />
         <button className="ghost" onClick={() => void onSearch()}><Filter size={16} />筛选</button>
@@ -1418,6 +1445,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
       return { ...item, ok: true, status: job.status, error: job.errorMessage ?? undefined };
     }) ?? current);
     if (!isOperationPending(job)) await onCreated();
+    return job;
   }, [onCreated]);
   useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     const failure = pollingFailure(error);
@@ -1462,8 +1490,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
       if (!item.jobId) {
         throw new Error("服务端没有返回任务 ID。");
       }
-      const job = await waitForOperation(item.jobId);
-      return { ...started, ok: operationState(job).ok, status: job.status === "completed" ? "active" : job.status, error: job.status === "completed" ? undefined : operationState(job).message };
+      return started;
     } catch (error) {
       return {
         ...started,
@@ -1528,10 +1555,8 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
           headers: { "idempotency-key": crypto.randomUUID() },
           body: JSON.stringify({}),
         });
-        next = { ...item, ok: true, jobId: queued.jobId, status: queued.status, error: undefined };
+        next = { ...item, ok: true, jobId: queued.jobId, status: "queued", error: undefined };
         replaceResult(item.domain, next);
-        const job = await waitForOperation(queued.jobId);
-        next = { ...next, ok: operationState(job).ok, status: job.status === "completed" ? "active" : job.status, error: job.status === "completed" ? undefined : operationState(job).message };
       } else {
         next = await createOneDomain(item.retryPayload as CreateDomainPayload);
       }
@@ -1641,6 +1666,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
             清空结果
           </button>
         </div>
+        {result && <div className="note">重试使用域名已保存的配置。若需修改，请到域名列表勾选“显示未完成配置”，删除原配置后重新添加。</div>}
         {!result ? (
           <EmptyState title="等待提交" text="每个域名会独立显示成功、失败或等待生效。" />
         ) : (
@@ -1660,7 +1686,8 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
                   <button
                     className="icon"
                     type="button"
-                    title="手动重新执行"
+                    title={item.id ? "重试已保存配置（不会应用本次提交的新配置）" : "重新提交"}
+                    aria-label={item.id ? "重试已保存配置" : "重新提交"}
                     disabled={retryingIds.includes(retryKey)}
                     onClick={() => void retryResult(item)}
                   >
@@ -1677,7 +1704,7 @@ function AddViewV2({ targets, groups, onCreated }: { targets: TargetService[]; g
   );
 }
 
-function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCreated: () => Promise<void> }) {
+function TargetsViewV2({ targets, workerScriptName, onCreated }: { targets: TargetService[]; workerScriptName?: string; onCreated: () => Promise<void> }) {
   const [name, setName] = useState("");
   const [targetHost, setTargetHost] = useState("");
   const [description, setDescription] = useState("");
@@ -1697,16 +1724,15 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
       setActionMessage(operationState(job).message);
       await onCreated();
     }
+    return job;
   }, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     setActionMessage(pollingFailure(error).message);
     if (error instanceof ApiError && error.status === 404) setPendingJobs((current) => current.filter((id) => id !== jobId));
   });
 
-  async function followJob(jobId: string) {
-    const job = await waitForOperation(jobId);
-    if (!operationState(job).ok) throw new Error(operationState(job).message);
-    setActionMessage(operationState(job).message);
-    if (isOperationPending(job)) setPendingJobs((current) => [...new Set([...current, jobId])]);
+  function trackJob(jobId: string) {
+    setActionMessage("任务已加入后台队列，将自动更新结果。");
+    setPendingJobs((current) => [...new Set([...current, jobId])]);
   }
 
   async function submit(event: React.FormEvent) {
@@ -1721,8 +1747,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
       setName("");
       setTargetHost("");
       setDescription("");
-      await onCreated();
-      await followJob(queued.jobId);
+      trackJob(queued.jobId);
       await onCreated();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "新增目标服务失败。");
@@ -1753,8 +1778,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
         headers: { "idempotency-key": crypto.randomUUID() },
         body: JSON.stringify({}),
       });
-      await onCreated();
-      await followJob(queued.jobId);
+      trackJob(queued.jobId);
       await onCreated();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "重新配置失败。");
@@ -1779,7 +1803,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
         headers: { "idempotency-key": crypto.randomUUID() },
         body: JSON.stringify({}),
       });
-      await followJob(queued.jobId);
+      trackJob(queued.jobId);
       await onCreated();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "删除目标服务失败。");
@@ -1864,7 +1888,7 @@ function TargetsViewV2({ targets, onCreated }: { targets: TargetService[]; onCre
           </div>
         )}
       </div>
-      {manualTarget && <ManualConfigModal target={manualTarget} onClose={() => setManualTarget(null)} />}
+      {manualTarget && <ManualConfigModal target={manualTarget} workerScriptName={workerScriptName} onClose={() => setManualTarget(null)} />}
     </section>
   );
 }
@@ -1883,7 +1907,7 @@ function dnsRecordName(target: TargetService): string {
   return target.targetHost;
 }
 
-function ManualConfigModal({ target, onClose }: { target: TargetService; onClose: () => void }) {
+function ManualConfigModal({ target, workerScriptName, onClose }: { target: TargetService; workerScriptName?: string; onClose: () => void }) {
   const recordName = dnsRecordName(target);
   const zoneName = target.cloudflareZoneName ?? "尚未识别，请先点击重新配置";
   const needsNs = target.nameserverStatus !== "active" && target.cloudflareNameservers.length > 0;
@@ -1945,7 +1969,7 @@ function ManualConfigModal({ target, onClose }: { target: TargetService; onClose
             <li>打开 Cloudflare Dashboard，进入 <strong>{zoneName}</strong> 的 DNS 页面。</li>
             <li>删除同名的 A、AAAA 或 CNAME 记录，避免和本系统接管记录冲突。</li>
             <li>新增 A 记录：Name 填 <strong>{recordName}</strong>，Content 填 <strong>192.0.2.1</strong>，Proxy 开启橙云。</li>
-            <li>进入 Workers Routes，为 <strong>{target.targetHost}/*</strong> 绑定 Worker <strong>link-shortener-manager</strong>。</li>
+            <li>进入 Workers Routes，为 <strong>{target.targetHost}/*</strong> 绑定 Worker <strong>{workerScriptName || "初始化检查中配置的 Worker"}</strong>。</li>
             <li>回到本页面点击“重新检测”。</li>
           </ol>
         </div>
@@ -1993,6 +2017,7 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
       }
       return { ...item, ...operationState(job), ...(job.status === "completed" ? operationResult<NameserverToolResult>(job) : {}), registrarId: typeof job.payload.registrarId === "string" ? job.payload.registrarId : item.registrarId, jobId };
     }) ?? current);
+    return job;
   }, []);
   useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     setResults((current) => current?.map((item) => item.jobId === jobId ? { ...item, ...pollingFailure(error) } : item) ?? current);
@@ -2019,13 +2044,12 @@ function NameserverToolView({ registrars }: { registrars: RegistrarStatus | null
         },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      started = { ...(data.results[0] ?? started), requestKey, registrarId: originalRegistrarId };
+      started = { ...(data.results[0] ?? started), status: "queued", requestKey, registrarId: originalRegistrarId };
       setResults((current) => current?.map((item) => item.domain === domain ? started : item) ?? current);
       if (!started.jobId) {
         throw new Error("服务端没有返回任务 ID。");
       }
-      const job = await waitForOperation(started.jobId);
-      return { ...started, ...operationState(job), ...(job.status === "completed" ? operationResult<NameserverToolResult>(job) : {}), jobId: started.jobId, requestKey };
+      return started;
     } catch (err) {
       return {
         ...started,
@@ -2222,6 +2246,7 @@ function CloudflareZoneDeleteView() {
       }
       return { ...item, ...operationState(job), ...completedResult, jobId };
     }) ?? current);
+    return job;
   }, []);
   useOperationPolling(pendingOperationIds, refreshOperation, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     setResults((current) => current?.map((item) => item.jobId === jobId ? { ...item, ...pollingFailure(error) } : item) ?? current);
@@ -2249,13 +2274,12 @@ function CloudflareZoneDeleteView() {
         },
         { timeoutMs: REQUEST_TIMEOUT_MS },
       );
-      started = { ...(data.results[0] ?? started), requestKey };
+      started = { ...(data.results[0] ?? started), status: "queued", requestKey };
       setResults((current) => current?.map((item) => item.domain === domain ? started : item) ?? current);
       if (!started.jobId) {
         throw new Error("服务端没有返回任务 ID。");
       }
-      const job = await waitForOperation(started.jobId);
-      return { ...started, ...operationState(job), ...(job.status === "completed" ? operationResult<CloudflareDeleteResult>(job) : {}), jobId: started.jobId, requestKey };
+      return started;
     } catch (err) {
       return {
         ...started,
@@ -2675,9 +2699,8 @@ function DetailView({ id, onBack, onUpdated }: { id: string; onBack: () => void;
     setMessage("");
     try {
       const queued = await api<{ jobId: string }>(`/api/domains/${id}/retry`, { method: "POST", headers: { "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({}) });
-      const job = await waitForOperation(queued.jobId);
-      setMessage(operationState(job).message);
-      if (isOperationPending(job)) setPendingJobs([job.id]);
+      setMessage("任务已加入后台队列，将自动更新结果。");
+      setPendingJobs([queued.jobId]);
       await onUpdated();
       await load();
     } catch (error) {
@@ -2695,6 +2718,7 @@ function DetailView({ id, onBack, onUpdated }: { id: string; onBack: () => void;
       await onUpdated();
       await load();
     }
+    return job;
   }, DOMAIN_POLL_INTERVAL_MS, (jobId, error) => {
     setMessage(pollingFailure(error).message);
     if (error instanceof ApiError && error.status === 404) setPendingJobs((current) => current.filter((value) => value !== jobId));

@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import worker from "../src/worker/index";
 import { shouldRecordPageView, visitorKeyFromRequest } from "../src/worker/redirect";
 import { today } from "../src/worker/shared";
 
@@ -7,6 +8,15 @@ function request(path: string, headers: Record<string, string> = {}, method = "G
 }
 
 describe("redirect visit accounting", () => {
+  it.each(["/.env", "/.git/config", "/vendor/phpunit/index.php"])("rejects scanner path %s before any database access", async (path) => {
+    const prepare = vi.fn(() => { throw new Error("Scanner must not access D1"); });
+    const response = await worker.fetch(request(path) as Parameters<typeof worker.fetch>[0], {
+      ADMIN_HOST: "admin.example.com", DB: { prepare },
+    } as unknown as Env, {} as ExecutionContext);
+    expect(response.status).toBe(404);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
   it("counts top-level document navigations", () => {
     expect(shouldRecordPageView(request("/", {
       accept: "text/html,application/xhtml+xml",

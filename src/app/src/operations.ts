@@ -11,7 +11,7 @@ export interface OperationJob {
   currentStep: string;
   errorMessage: string | null;
   payload: Record<string, unknown>;
-  pollError?: string;
+  nextAttemptAt?: string;
 }
 
 export const REQUEST_TIMEOUT_MS = 45_000;
@@ -47,25 +47,6 @@ export async function api<T>(
   }
 }
 
-export async function waitForOperation(jobId: string): Promise<OperationJob> {
-  const deadline = Date.now() + 120_000;
-  let job: OperationJob = { id: jobId, subjectId: "", status: "queued", currentStep: "queued", errorMessage: null, payload: {} };
-  while (Date.now() < deadline) {
-    try {
-      job = await api<OperationJob>(`/api/jobs/${jobId}`, undefined, { timeoutMs: Math.max(1, Math.min(15_000, deadline - Date.now())) });
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) throw error;
-      if (error instanceof ApiError && error.status === 404) {
-        return { ...job, status: "unavailable", errorMessage: error.message };
-      }
-      return { ...job, pollError: `暂时无法确认任务状态：${error instanceof Error ? error.message : "网络异常"}` };
-    }
-    if (job.status === "completed" || job.status === "failed" || job.status === "retry_wait") return job;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(DOMAIN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
-  }
-  return { ...job, pollError: "后台任务仍在处理，将继续自动查询。" };
-}
-
 export function operationResult<T>(job: OperationJob): Partial<T> {
   const result = job.payload.result;
   return result && typeof result === "object" && !Array.isArray(result) ? result as Partial<T> : {};
@@ -75,12 +56,28 @@ export function operationState(job: OperationJob) {
   return {
     ok: job.status !== "failed" && job.status !== "unavailable",
     status: job.status,
-    message: job.pollError ?? job.errorMessage ?? (job.status === "completed" ? "处理完成。" : "后台任务仍在处理，将继续自动查询。"),
+    message: job.errorMessage ?? (job.status === "completed" ? "处理完成。" : "后台任务仍在处理，将继续自动查询。"),
   };
 }
 
 export function isOperationPending(job: OperationJob): boolean {
   return job.status === "queued" || job.status === "running" || job.status === "retry_wait";
+}
+
+export function operationPollDelay(job: OperationJob, intervalMs: number): number {
+  if (job.status !== "retry_wait") return intervalMs;
+  const remaining = Date.parse(job.nextAttemptAt ?? "") - Date.now();
+  return Number.isFinite(remaining) ? Math.max(30_000, Math.min(60_000, remaining)) : 60_000;
+}
+
+export function retainedDateRange(retentionDays: number, now = Date.now()) {
+  const days = Number.isInteger(retentionDays) && retentionDays > 0 ? retentionDays : 30;
+  const shanghaiNow = now + 8 * 60 * 60_000;
+  return {
+    days,
+    from: new Date(shanghaiNow - (days - 1) * 86_400_000).toISOString().slice(0, 10),
+    to: new Date(shanghaiNow).toISOString().slice(0, 10),
+  };
 }
 
 export function isProcessingStatus(status?: string | null): boolean {

@@ -13,7 +13,7 @@ A Cloudflare-native redirect management app for operating many entry domains fro
 - Cloudflare Zone deletion helper.
 - Short link generation on configured target service domains.
 - Traffic uses one privacy-safe IP hash per domain or short link per Shanghai calendar day. Duplicate requests do not add UV; PV/request volume is not recorded.
-- Frontend-driven one-at-a-time batch processing to avoid Cloudflare Worker subrequest limits.
+- Frontend submits batch items one at a time; cron executes accepted jobs serially.
 
 ## Security Notice
 
@@ -158,11 +158,24 @@ Migration `0017` removes legacy provider credentials from D1, so its Wrangler Se
 
 Migration `0022` drops the unused `visit_events`, `visit_daily_stats`, and `traffic_daily_stats` tables. The current `traffic_daily_visitors` facts and their UV counts are preserved. Legacy PV and raw event detail are not preserved in the live database; export D1 and keep the export before applying this migration. The two legacy `visit_daily_uniques` and `short_link_daily_uniques` tables remain as historical archives because their complete UV history was never migrated. The app does not read or write these archives, and they are not merged into current counts to avoid incompatible visitor keys or day boundaries producing duplicate UV.
 
-For an installation already migrated through `0021`, deploy this release first, verify redirects and the scheduled cleanup, and then apply `0022`. This release works both before and after that cleanup. The previous Worker still queries `visit_events` in its cron and must not run after `0022`. Returning to that previous Worker requires restoring the matching database backup as well. Installations not yet at `0021` must use the coordinated maintenance procedure above.
+For an installation still at `0021`, first deploy the traffic-cleanup-compatible version `15e0693`, verify redirects and scheduled cleanup, and then apply `0022`. That version works before and after the cleanup. Older Workers still query `visit_events` in cron and must not run after `0022`; returning to those versions requires the matching database backup. Installations not yet at `0021` must use the coordinated maintenance procedure above.
+
+### Queue recovery and request keys (`0023`)
+
+From a deployment already at `0022` / `15e0693`, back up D1 and record the current Worker version, then apply `0023` **before deploying the current code**. It adds lease-loss and provider-failure counters plus a request-key alias table, without removing existing data. The old Worker remains compatible with the added schema; the new Worker requires it. Existing keys are backfilled, and keys written by the old Worker between migration and deployment remain recognized. Rollback to `15e0693` does not require removing the added schema.
+
+Build, test and dry-run first, then use the production config for both migration and deployment:
+
+```bash
+npx wrangler d1 migrations apply multi-domain-redirect-manager --remote --config .wrangler/deploy.jsonc
+npm run deploy -- --config .wrangler/deploy.jsonc
+```
+
+Use the actual database name from that config. Ensure its cron is `* * * * *`: the queue now executes only from scheduled events. After deployment, submit a job and confirm it leaves `queued` on a scheduled run. Polling a task or leaving the admin page open does not execute it.
 
 ### Traffic retention
 
-`VISIT_EVENT_RETENTION_DAYS` is a positive whole number, defaulting to 30. Cleanup retains today and the preceding N−1 Shanghai calendar days. Invalid values fall back to 30. Displayed totals sum daily UV within the retained data; a visitor returning on another day counts again. They are neither lifetime traffic nor visitors deduplicated across the entire period. Cleanup can reduce these totals. The global domain counts include waiting and failed domains; traffic in the global summary includes only visible active entry domains.
+`VISIT_EVENT_RETENTION_DAYS` is a positive whole number, defaulting to 30. Cleanup retains today and the preceding N−1 Shanghai calendar days. Invalid values fall back to 30. The UI limits presets and custom dates to that period. API date queries return only records still present; widening a filter cannot recover expired data. Displayed totals sum daily UV within the retained data; a visitor returning on another day counts again. They are neither lifetime traffic nor visitors deduplicated across the entire period. Cleanup can reduce these totals. The global domain counts include waiting and failed domains; traffic in the global summary includes only visible active entry domains. Click the waiting/failed counts or enable “显示未完成配置” to inspect, retry or delete hidden configurations. This setting does not make them publicly routable.
 
 ### Recovering the admin password
 
@@ -221,16 +234,20 @@ After deployment:
 
 ## Batch Operation Model
 
-Cloudflare Workers have subrequest limits per Worker invocation. To reduce failures, the frontend sends batch operations one item at a time:
+Cloudflare Workers have subrequest limits per Worker invocation. The frontend submits each batch item after the previous item receives an acceptance response, without waiting for background completion:
 
 - Add entry domains one at a time.
 - Cloudflare NS intake one domain at a time.
 - Cloudflare Zone deletion one domain at a time.
 - Multi-select deletion one id at a time.
 
-Accepted operations keep their task IDs. Waiting for nameservers, a browser timeout, or a temporary network error does not mean the backend task failed; the UI continues checking known task IDs. If a page reload or lost response leaves no task ID, the result is marked unconfirmed and can be retried. NS and Zone tools reuse the saved request key for unconfirmed submissions. Only a completed task is reported as successful, and an explicitly failed task can be retried. Reconfiguring an already active entry domain keeps its existing redirect available while the task records progress or errors.
+Accepted operations keep their task IDs. Waiting for nameservers, a browser timeout, or a temporary network error does not mean the backend task failed; the UI continues checking known task IDs. Waiting jobs are polled every 30–60 seconds according to their next check time, including when that time has passed. Polling pauses in hidden tabs. If a page reload or lost response leaves no task ID, the result is marked unconfirmed and can be retried. NS and Zone tools reuse the saved request key for unconfirmed submissions. Only a completed task is reported as successful, and an explicitly failed task can be retried. Reconfiguring an already active entry domain keeps its existing redirect available while the task records progress or errors.
 
-The backend retains a single leased job across requests, browser tabs, and cron. A nameserver retry releases its lease while waiting, so other jobs can proceed. Automatic activation checks reuse completed configuration instead of resubmitting NS/DNS/routes. New explicit repairs still verify the configuration. The cron is a fallback; task submissions and status queries also wake the queue.
+The backend retains a single leased job across cron invocations. Each run handles at most two jobs within an eight-minute scheduling budget. A job has a four-minute cancellation budget and a five-minute lease; provider requests also retain their ten-second timeout. Three consecutive expired leases stop an interrupted task instead of reclaiming it forever. Provider failures have a separate bounded retry counter, so normal NS propagation checks do not exhaust that allowance. Old lease holders cannot overwrite task progress or automation/health results. Automatic health checks run in small batches only when that cron invocation did not process jobs.
+
+A nameserver retry releases its lease while waiting, so other jobs can proceed. Automatic activation checks reuse completed configuration instead of resubmitting NS/DNS/routes. An explicit repair of a waiting/queued domain or target service advances the same job to the next cron run and requests full validation; a running job is reused without interruption. Passive resubmission and replaying the same request key do not reschedule or duplicate work. A new repair after terminal failure creates a fresh job. Entry subdomains reuse the closest existing Cloudflare parent Zone and do not submit registrar nameserver changes for the subdomain.
+
+Detailed steps are removed 30 days after a job finishes. Job results and request keys remain available for safe replay. Provider and unexpected API failures return an `X-Request-Id` that can be matched to structured logs; logs contain safe categories/codes, not raw upstream URLs or credentials.
 
 Deleting entry domains removes only this application's configuration. The separate Zone deletion tool refuses to delete a Zone still used by the admin host, a target service, or an entry domain, including subdomains. Remove or relocate those dependencies explicitly first.
 

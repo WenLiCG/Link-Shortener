@@ -50,7 +50,7 @@ function providers(beforeRequest?: (url: URL) => Promise<void>) {
       return Response.json({ Response: { ResponseCode: 0, Status: "success" } });
     }
     const zone = { id: state.zoneId, name: host, status: state.status, name_servers: ["a.ns", "b.ns"] };
-    if (url.pathname === "/client/v4/zones") return Response.json({ success: true, result: [zone] });
+    if (url.pathname === "/client/v4/zones") return Response.json({ success: true, result: url.searchParams.get("name") === zone.name ? [zone] : [] });
     if (/\/zones\/[^/]+$/.test(url.pathname)) {
       if (state.failZoneRead) return new Response("denied", { status: 403 });
       if (!url.pathname.endsWith(`/${state.zoneId}`)) return new Response("missing", { status: 404 });
@@ -71,6 +71,24 @@ function providers(beforeRequest?: (url: URL) => Promise<void>) {
 }
 
 describe("domain job recovery", () => {
+  it("reuses an ancestor Zone for entry subdomains without changing registrar nameservers", async () => {
+    await domain();
+    const childHost = `entry.${host}`;
+    await env.DB.prepare("UPDATE redirect_domains SET domain = ? WHERE id = 'recovery'").bind(childHost).run();
+    const job = await provision();
+    const upstream = providers();
+    await processNextJob(withDynadot);
+    expect(upstream.requests.some((request) => request.includes("api3.json"))).toBe(false);
+    expect(upstream.requests.some((request) => request === "POST /client/v4/zones")).toBe(false);
+    expect(await env.DB.prepare("SELECT dynadot_status FROM redirect_domains WHERE id = 'recovery'").first("dynadot_status")).toBe("inherited_zone");
+    upstream.requests.length = 0;
+    upstream.state.status = "active";
+    await due(job.id);
+    await processNextJob(withDynadot);
+    expect(upstream.requests).toEqual(["GET /client/v4/zones/zone-recovery"]);
+    expect((await SELF.fetch(`https://${childHost}/`, { redirect: "manual" })).status).toBe(302);
+  });
+
   it.each([false, true])("keeps active redirects serving through configuration (provider failure: %s)", async (fail) => {
     await domain(true);
     const job = await retryDomain(env.DB, "recovery", "repair-active");

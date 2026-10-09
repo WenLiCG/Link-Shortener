@@ -1,6 +1,6 @@
 import { handleApi, apiError } from "./api";
 import { runScheduled } from "./automation";
-import { handleRedirect } from "./redirect";
+import { handleRedirect, isScannerPath } from "./redirect";
 import { staticResponse } from "./static-assets";
 import { handleTargetService } from "./target-service";
 
@@ -31,6 +31,9 @@ export default {
     if (isAdminHost(url.hostname, env)) {
       const assets = Reflect.get(env, "ASSETS") as Fetcher | undefined;
       return assets ? assets.fetch(request) : staticResponse(url.pathname) ?? new Response("Not found", { status: 404 });
+    }
+    if (isScannerPath(url.pathname)) {
+      return new Response("Not found", { status: 404 });
     }
     const targetResponse = await handleTargetService(request, env, ctx);
     if (targetResponse) {

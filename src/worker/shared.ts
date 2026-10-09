@@ -20,6 +20,7 @@ export type ApiErrorCode =
   | "rate_limited"
   | "not_found"
   | "conflict"
+  | "idempotency_key_conflict"
   | "server_error";
 
 export interface ApiErrorBody {
@@ -156,6 +157,8 @@ export interface DomainJob {
   currentStep: string;
   errorMessage: string | null;
   attemptCount: number;
+  leaseLossCount: number;
+  failureCount: number;
   maxAttempts: number;
   nextAttemptAt: string;
   leaseToken: string | null;

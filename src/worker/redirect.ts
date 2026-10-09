@@ -83,7 +83,7 @@ function isLikelyBotRequest(request: Request): boolean {
 const SCANNER_PATHS = new Set(["/.env", "/.git/config", "/wp-login.php", "/xmlrpc.php"]);
 const SCANNER_PREFIXES = ["/.git/", "/.aws/", "/.ssh/", "/vendor/"];
 
-function isScannerPath(pathname: string): boolean {
+export function isScannerPath(pathname: string): boolean {
   const path = pathname.toLowerCase();
   return SCANNER_PATHS.has(path) || SCANNER_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
@@ -133,15 +133,12 @@ export function shouldRecordPageView(request: Request): boolean {
 export async function handleRedirect(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const host = url.host.split(":")[0] ?? url.host;
-  if (url.pathname.startsWith("/api/")) {
+  if (url.pathname.startsWith("/api/") || isScannerPath(url.pathname)) {
     return new Response("Not found", { status: 404 });
   }
   const domain = await findDomainByHost(env.DB, host);
   if (!domain) {
     return new Response("Redirect domain is not configured.", { status: 404 });
-  }
-  if (isScannerPath(url.pathname)) {
-    return new Response("Not found", { status: 404 });
   }
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } });

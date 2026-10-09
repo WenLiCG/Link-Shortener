@@ -15,6 +15,7 @@ import {
   today,
 } from "./shared";
 import { ProviderError } from "./provider-error";
+import { HttpError } from "./http";
 
 type RowValue = string | number | null;
 type Row = Record<string, RowValue>;
@@ -184,6 +185,8 @@ function mapJob(row: Row, steps: JobStep[]): DomainJob {
     currentStep: text(row.current_step),
     errorMessage: optionalText(row.error_message),
     attemptCount: numberValue(row.attempt_count),
+    leaseLossCount: numberValue(row.lease_loss_count),
+    failureCount: numberValue(row.failure_count),
     maxAttempts: numberValue(row.max_attempts),
     nextAttemptAt: text(row.next_attempt_at),
     leaseToken: optionalText(row.lease_token),
@@ -208,11 +211,9 @@ export async function listTargets(db: D1Database): Promise<TargetService[]> {
   return (
     await all(
       db,
-      `SELECT t.*, CAST(COALESCE(COUNT(DISTINCT d.id), 0) + COALESCE(COUNT(DISTINCT s.id), 0) AS INTEGER) AS usage_count
+      `SELECT t.*, (SELECT COUNT(*) FROM redirect_domains d WHERE d.target_service_id = t.id)
+         + (SELECT COUNT(*) FROM short_links s WHERE s.target_service_id = t.id) AS usage_count
        FROM target_services t
-       LEFT JOIN redirect_domains d ON d.target_service_id = t.id
-       LEFT JOIN short_links s ON s.target_service_id = t.id
-       GROUP BY t.id
        ORDER BY t.created_at DESC`,
     )
   ).map(mapTarget);
@@ -233,6 +234,8 @@ export async function createTarget(
        (id, type, subject_type, subject_id, payload, idempotency_key)
        VALUES (?, 'target_repair', 'target_service', ?, '{}', ?)`,
     ).bind(jobId, id, `target_repair:${id}:initial`),
+    db.prepare("INSERT INTO job_request_keys (request_key, job_id) VALUES (?, ?)")
+      .bind(`target_repair:${id}:initial`, jobId),
   ]);
   const row = await first(db, "SELECT *, 0 AS usage_count FROM target_services WHERE id = ?", id);
   if (!row) {
@@ -255,12 +258,10 @@ export async function updateTargetForward(db: D1Database, id: string, forwardTar
 export async function getTargetById(db: D1Database, id: string): Promise<TargetService | null> {
   const row = await first(
     db,
-    `SELECT t.*, CAST(COALESCE(COUNT(DISTINCT d.id), 0) + COALESCE(COUNT(DISTINCT s.id), 0) AS INTEGER) AS usage_count
+    `SELECT t.*, (SELECT COUNT(*) FROM redirect_domains d WHERE d.target_service_id = t.id)
+       + (SELECT COUNT(*) FROM short_links s WHERE s.target_service_id = t.id) AS usage_count
      FROM target_services t
-     LEFT JOIN redirect_domains d ON d.target_service_id = t.id
-     LEFT JOIN short_links s ON s.target_service_id = t.id
-     WHERE t.id = ?
-     GROUP BY t.id`,
+     WHERE t.id = ?`,
     id,
   );
   return row ? mapTarget(row) : null;
@@ -276,7 +277,7 @@ export async function countShortLinksForTarget(db: D1Database, targetId: string)
   return numberValue(row?.total ?? 0);
 }
 
-export async function deleteTarget(db: D1Database, id: string, targetHost: string): Promise<{ deleted: boolean; domainsMarked: number; shortLinksDeleted: number }> {
+export async function deleteTarget(db: D1Database, id: string, targetHost: string, lease?: Pick<DomainJob, "id" | "leaseToken">): Promise<{ deleted: boolean; domainsMarked: number; shortLinksDeleted: number }> {
   const [marked, shortLinks, result] = await db.batch([
     db.prepare(
       `UPDATE redirect_domains
@@ -285,11 +286,11 @@ export async function deleteTarget(db: D1Database, id: string, targetHost: strin
            status = 'failed',
            last_error = '目标服务列表中服务被删除了',
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE target_service_id = ?`,
+       WHERE target_service_id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`,
     )
-      .bind(targetHost, id),
-    db.prepare("DELETE FROM short_links WHERE target_service_id = ?").bind(id),
-    db.prepare("DELETE FROM target_services WHERE id = ?").bind(id),
+      .bind(targetHost, id, ...(lease ? [lease.id, lease.leaseToken] : [])),
+    db.prepare(`DELETE FROM short_links WHERE target_service_id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`).bind(id, ...(lease ? [lease.id, lease.leaseToken] : [])),
+    db.prepare(`DELETE FROM target_services WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`).bind(id, ...(lease ? [lease.id, lease.leaseToken] : [])),
   ]);
   return {
     deleted: (result.meta.changes ?? 0) > 0,
@@ -380,31 +381,37 @@ export async function deleteShortLinks(db: D1Database, ids: string[]): Promise<n
   return deleted;
 }
 
-export async function markTargetHealthChecking(db: D1Database, id: string): Promise<void> {
-  await db
+const ACTIVE_JOB_LEASE = `EXISTS (SELECT 1 FROM domain_jobs j WHERE j.id = ? AND j.status = 'running'
+  AND j.lease_token = ? AND j.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`;
+
+export async function markTargetHealthChecking(db: D1Database, id: string, lease?: Pick<DomainJob, "id" | "leaseToken">): Promise<void> {
+  const updated = await db
     .prepare(
       `UPDATE target_services
        SET health_status = 'checking', health_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?`,
+       WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`,
     )
-    .bind(id)
+    .bind(id, ...(lease ? [lease.id, lease.leaseToken] : []))
     .run();
+  if (lease && !updated.meta.changes) throw new Error("job_lease_lost");
 }
 
 export async function updateTargetHealth(
   db: D1Database,
   id: string,
   result: { status: "ok" | "failed"; httpStatus: number | null; error: string | null },
+  lease?: Pick<DomainJob, "id" | "leaseToken">,
 ): Promise<void> {
-  await db
+  const updated = await db
     .prepare(
       `UPDATE target_services
        SET health_status = ?, health_http_status = ?, health_error = ?, health_checked_at = ?,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?`,
+       WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`,
     )
-    .bind(result.status, result.httpStatus, result.error, new Date().toISOString(), id)
+    .bind(result.status, result.httpStatus, result.error, new Date().toISOString(), id, ...(lease ? [lease.id, lease.leaseToken] : []))
     .run();
+  if (lease && !updated.meta.changes) throw new Error("job_lease_lost");
 }
 
 export async function updateTargetAutomation(
@@ -422,6 +429,7 @@ export async function updateTargetAutomation(
     lastError: string | null;
     lastCheckedAt: string;
   }>,
+  lease?: Pick<DomainJob, "id" | "leaseToken">,
 ): Promise<void> {
   const assignments: string[] = [];
   const binds: unknown[] = [];
@@ -446,7 +454,9 @@ export async function updateTargetAutomation(
   }
   assignments.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
   binds.push(id);
-  await db.prepare(`UPDATE target_services SET ${assignments.join(", ")} WHERE id = ?`).bind(...binds).run();
+  if (lease) binds.push(lease.id, lease.leaseToken);
+  const updated = await db.prepare(`UPDATE target_services SET ${assignments.join(", ")} WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`).bind(...binds).run();
+  if (lease && !updated.meta.changes) throw new Error("job_lease_lost");
 }
 
 export async function listStaleTargetIds(db: D1Database, limit = 10): Promise<string[]> {
@@ -926,15 +936,17 @@ export async function addJobStep(
   status: string,
   message?: string,
   metadata?: Record<string, unknown>,
+  leaseToken?: string,
 ): Promise<void> {
-  await db
-    .prepare("INSERT INTO job_steps (id, job_id, step, status, message, metadata) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(crypto.randomUUID(), jobId, step, status, message ?? null, metadata ? JSON.stringify(metadata) : null)
-    .run();
-  await db
-    .prepare("UPDATE domain_jobs SET current_step = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'running'")
-    .bind(step, jobId)
-    .run();
+  const results = await db.batch([
+    db.prepare(`INSERT INTO job_steps (id, job_id, step, status, message, metadata)
+      SELECT ?, ?, ?, ?, ?, ? ${leaseToken ? `WHERE ${ACTIVE_JOB_LEASE}` : ""}`)
+      .bind(crypto.randomUUID(), jobId, step, status, message ?? null, metadata ? JSON.stringify(metadata) : null, ...(leaseToken ? [jobId, leaseToken] : [])),
+    db.prepare(`UPDATE domain_jobs SET current_step = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE id = ? AND status = 'running' ${leaseToken ? `AND ${ACTIVE_JOB_LEASE}` : ""}`)
+      .bind(step, jobId, ...(leaseToken ? [jobId, leaseToken] : [])),
+  ]);
+  if (leaseToken && !results[0].meta.changes) throw new Error("job_lease_lost");
 }
 
 export async function updateDomainAutomation(
@@ -953,6 +965,7 @@ export async function updateDomainAutomation(
     lastCheckedAt: string;
     listVisible: boolean;
   }>,
+  lease?: Pick<DomainJob, "id" | "leaseToken">,
 ): Promise<void> {
   const assignments: string[] = [];
   const binds: unknown[] = [];
@@ -981,60 +994,102 @@ export async function updateDomainAutomation(
   }
   assignments.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
   binds.push(id);
-  await db.prepare(`UPDATE redirect_domains SET ${assignments.join(", ")} WHERE id = ?`).bind(...binds).run();
+  if (lease) binds.push(lease.id, lease.leaseToken);
+  const updated = await db.prepare(`UPDATE redirect_domains SET ${assignments.join(", ")} WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`).bind(...binds).run();
+  if (lease && !updated.meta.changes) throw new Error("job_lease_lost");
 }
 
 export async function retryDomain(
   db: D1Database,
   id: string,
   idempotencyKey: string,
+  explicit = false,
+): Promise<{ id: string; status: JobStatus }> {
+  return enqueueRepair(db, "redirect_domain", id, idempotencyKey, explicit);
+}
+
+export async function retryTarget(db: D1Database, id: string, idempotencyKey: string): Promise<{ id: string; status: JobStatus }> {
+  return enqueueRepair(db, "target_service", id, idempotencyKey, true);
+}
+
+async function enqueueRepair(
+  db: D1Database,
+  subjectType: "redirect_domain" | "target_service",
+  id: string,
+  idempotencyKey: string,
+  explicit: boolean,
 ): Promise<{ id: string; status: JobStatus }> {
   const jobId = crypto.randomUUID();
-  const results = await db.batch<{ id: string; status: JobStatus }>([
+  const type = subjectType === "redirect_domain" ? "domain_retry" : "target_repair";
+  const repairTypes = "('domain_provision', 'domain_retry', 'target_repair')";
+  const results = await db.batch<{ id: string; status: JobStatus; subject_type: string; subject_id: string; type: string }>([
+    db.prepare(
+      `INSERT OR IGNORE INTO job_request_keys (request_key, job_id)
+       SELECT idempotency_key, id FROM domain_jobs WHERE idempotency_key = ?`,
+    ).bind(idempotencyKey),
     db.prepare(
       `INSERT INTO domain_jobs
        (id, redirect_domain_id, type, subject_type, subject_id, payload, idempotency_key)
-       SELECT ?, ?, 'domain_retry', 'redirect_domain', ?, '{}', ?
-       WHERE NOT EXISTS (
+       SELECT ?, ?, ?, ?, ?, '{}', ?
+       WHERE NOT EXISTS (SELECT 1 FROM job_request_keys WHERE request_key = ?)
+       AND NOT EXISTS (
          SELECT 1 FROM domain_jobs
-         WHERE subject_type = 'redirect_domain' AND subject_id = ?
-           AND type IN ('domain_provision', 'domain_retry')
+         WHERE subject_type = ? AND subject_id = ?
+           AND type IN ${repairTypes}
            AND status IN ('queued', 'running', 'retry_wait')
        )
        ON CONFLICT(idempotency_key) DO NOTHING`,
-    ).bind(jobId, id, id, idempotencyKey, id),
-    db
-      .prepare(
-        `UPDATE redirect_domains
-         SET status = 'validating',
-             last_error = NULL,
-             list_visible = 0,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ? AND NOT (status = 'active' AND list_visible = 1)
-           AND EXISTS (SELECT 1 FROM domain_jobs WHERE id = ?)`,
-      )
-      .bind(id, jobId),
+    ).bind(jobId, subjectType === "redirect_domain" ? id : null, type, subjectType, id, idempotencyKey, idempotencyKey, subjectType, id),
     db.prepare(
-      `SELECT id, status FROM domain_jobs
-       WHERE (subject_type = 'redirect_domain' AND subject_id = ?
-         AND type IN ('domain_provision', 'domain_retry')
-         AND status IN ('queued', 'running', 'retry_wait'))
-         OR idempotency_key = ?
-       ORDER BY CASE WHEN status IN ('queued', 'running', 'retry_wait') THEN 0 ELSE 1 END, created_at DESC
+      `UPDATE domain_jobs SET status = 'queued', current_step = 'queued',
+         next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), error_message = NULL,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE ? = 1 AND subject_type = ? AND subject_id = ? AND type IN ${repairTypes}
+         AND status IN ('queued', 'retry_wait')
+         AND NOT EXISTS (SELECT 1 FROM job_request_keys WHERE request_key = ?)`,
+    ).bind(explicit ? 1 : 0, subjectType, id, idempotencyKey),
+    db.prepare(
+      `UPDATE redirect_domains SET status = 'validating', last_error = NULL, list_visible = 0,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ? AND NOT (status = 'active' AND list_visible = 1)
+         AND EXISTS (SELECT 1 FROM domain_jobs WHERE id = ? AND subject_type = 'redirect_domain')`,
+    ).bind(id, jobId),
+    db.prepare(
+      `UPDATE target_services SET health_status = 'checking',
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ? AND ? = 'target_service'
+         AND EXISTS (SELECT 1 FROM domain_jobs WHERE subject_type = 'target_service' AND subject_id = ?
+           AND type = 'target_repair' AND status = 'queued')
+         AND NOT EXISTS (SELECT 1 FROM job_request_keys WHERE request_key = ?)`,
+    ).bind(id, subjectType, id, idempotencyKey),
+    db.prepare(
+      `INSERT OR IGNORE INTO job_request_keys (request_key, job_id)
+       SELECT ?, id FROM domain_jobs WHERE subject_type = ? AND subject_id = ?
+         AND type IN ${repairTypes} AND status IN ('queued', 'running', 'retry_wait')
+       ORDER BY created_at, id
        LIMIT 1`,
-    ).bind(id, idempotencyKey),
+    ).bind(idempotencyKey, subjectType, id),
+    db.prepare(
+      `SELECT j.id, j.status, j.subject_type, j.subject_id, j.type FROM job_request_keys k
+       JOIN domain_jobs j ON j.id = k.job_id WHERE k.request_key = ?`,
+    ).bind(idempotencyKey),
   ]);
-  const row = results[2].results[0];
+  const row = results[6].results[0];
   if (!row) {
     throw new Error("job_enqueue_failed");
   }
-  return row;
+  const expectedTypes = subjectType === "redirect_domain" ? ["domain_provision", "domain_retry"] : ["target_repair"];
+  if (row.subject_type !== subjectType || row.subject_id !== id || !expectedTypes.includes(row.type)) {
+    throw new HttpError(409, "idempotency_key_conflict", "该请求标识已用于其他操作，请刷新后重试。");
+  }
+  return { id: row.id, status: row.status };
 }
 
-export async function deleteDomains(db: D1Database, ids: string[]): Promise<number> {
+export async function deleteDomains(db: D1Database, ids: string[], lease?: Pick<DomainJob, "id" | "leaseToken">): Promise<number> {
   let deleted = 0;
   for (const id of ids) {
-    const result = await db.prepare("DELETE FROM redirect_domains WHERE id = ?").bind(id).run();
+    const result = await db.prepare(`DELETE FROM redirect_domains WHERE id = ? ${lease ? `AND ${ACTIVE_JOB_LEASE}` : ""}`)
+      .bind(id, ...(lease ? [lease.id, lease.leaseToken] : [])).run();
     deleted += result.meta.changes ?? 0;
   }
   return deleted;
@@ -1109,11 +1164,16 @@ export async function enqueueJob(
   input: EnqueueJobInput,
 ): Promise<{ id: string; status: JobStatus }> {
   const id = crypto.randomUUID();
-  await db
-    .prepare(
+  const results = await db.batch<{ id: string; status: JobStatus; subject_type: string; subject_id: string; type: string }>([
+    db.prepare(
+      `INSERT OR IGNORE INTO job_request_keys (request_key, job_id)
+       SELECT idempotency_key, id FROM domain_jobs WHERE idempotency_key = ?`,
+    ).bind(input.idempotencyKey),
+    db.prepare(
       `INSERT INTO domain_jobs
        (id, redirect_domain_id, type, subject_type, subject_id, payload, idempotency_key, max_attempts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (SELECT 1 FROM job_request_keys WHERE request_key = ?)
        ON CONFLICT(idempotency_key) DO NOTHING`,
     )
     .bind(
@@ -1125,34 +1185,84 @@ export async function enqueueJob(
       JSON.stringify(input.payload),
       input.idempotencyKey,
       input.maxAttempts ?? 5,
-    )
-    .run();
-  const row = await db
-    .prepare("SELECT id, status FROM domain_jobs WHERE idempotency_key = ?")
-    .bind(input.idempotencyKey)
-    .first<{ id: string; status: JobStatus }>();
+      input.idempotencyKey,
+    ),
+    db.prepare(
+      `INSERT OR IGNORE INTO job_request_keys (request_key, job_id)
+       SELECT idempotency_key, id FROM domain_jobs WHERE idempotency_key = ?`,
+    ).bind(input.idempotencyKey),
+    db.prepare(
+      `SELECT j.id, j.status, j.subject_type, j.subject_id, j.type FROM job_request_keys k
+       JOIN domain_jobs j ON j.id = k.job_id WHERE k.request_key = ?`,
+    ).bind(input.idempotencyKey),
+  ]);
+  const row = results[3].results[0];
   if (!row) {
     throw new Error("job_enqueue_failed");
   }
-  return row;
+  if (row.subject_type !== input.subjectType || row.subject_id !== input.subjectId || row.type !== input.type) {
+    throw new HttpError(409, "idempotency_key_conflict", "该请求标识已用于其他操作，请刷新后重试。");
+  }
+  return { id: row.id, status: row.status };
 }
 
-export async function getJobById(db: D1Database, id: string): Promise<DomainJob | null> {
+export async function getJobById(db: D1Database, id: string, includeSteps = true): Promise<DomainJob | null> {
   const row = await first(db, "SELECT * FROM domain_jobs WHERE id = ?", id);
   if (!row) {
     return null;
   }
-  const steps = (await all(db, "SELECT * FROM job_steps WHERE job_id = ? ORDER BY created_at", id)).map(mapStep);
+  const steps = includeSteps ? (await all(db, "SELECT * FROM job_steps WHERE job_id = ? ORDER BY created_at", id)).map(mapStep) : [];
   return mapJob(row, steps);
 }
 
-export async function claimNextJob(db: D1Database, leaseSeconds = 600): Promise<DomainJob | null> {
-  // shortcut: one global lease serializes provider changes; use per-subject leases if sustained backlog requires concurrency.
+export const JOB_LEASE_SECONDS = 300;
+
+export async function claimNextJob(db: D1Database, leaseSeconds = JOB_LEASE_SECONDS): Promise<DomainJob | null> {
+  // ponytail: one global lease serializes provider changes; use per-subject leases if sustained backlog requires concurrency.
   const now = new Date().toISOString();
   const leaseToken = crypto.randomUUID();
   const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
-  const row = await db
-    .prepare(
+  const propagationCutoff = new Date(Date.now() - 48 * 60 * 60_000).toISOString();
+  const results = await db.batch<Row>([
+    db.prepare(
+      `UPDATE domain_jobs SET status = 'failed',
+         error_message = CASE WHEN created_at <= ? AND type IN ('domain_provision', 'domain_retry', 'target_repair')
+           THEN 'Nameserver 在 48 小时内未生效，请检查注册商设置后重试。'
+           ELSE '任务连续 3 次执行中断，请手动重试。' END,
+         lease_loss_count = lease_loss_count + CASE WHEN status = 'running' THEN 1 ELSE 0 END,
+         lease_token = NULL, lease_expires_at = NULL, finished_at = ?, updated_at = ?
+       WHERE (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?) AND lease_loss_count >= 2)
+         OR (type IN ('domain_provision', 'domain_retry', 'target_repair') AND created_at <= ?
+           AND ((status IN ('queued', 'retry_wait') AND current_step = 'waiting_nameserver')
+             OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?))))`,
+    ).bind(propagationCutoff, now, now, now, propagationCutoff, now),
+    db.prepare(
+      `UPDATE domain_jobs SET status = 'queued', lease_loss_count = lease_loss_count + 1,
+         lease_token = NULL, lease_expires_at = NULL, next_attempt_at = ?, updated_at = ?,
+         error_message = '上次执行中断，正在重新处理。'
+       WHERE status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`,
+    ).bind(now, now, now),
+    db.prepare(
+      `UPDATE redirect_domains SET
+         status = CASE WHEN status = 'active' AND list_visible = 1 THEN status ELSE 'failed' END,
+         last_error = (SELECT error_message FROM domain_jobs WHERE subject_type = 'redirect_domain'
+           AND subject_id = redirect_domains.id AND status = 'failed' AND finished_at = ? LIMIT 1), updated_at = ?
+       WHERE id IN (SELECT subject_id FROM domain_jobs WHERE subject_type = 'redirect_domain' AND status = 'failed' AND finished_at = ?)
+         AND NOT EXISTS (SELECT 1 FROM domain_jobs WHERE subject_type = 'redirect_domain' AND subject_id = redirect_domains.id
+           AND status IN ('queued', 'running', 'retry_wait'))`,
+    ).bind(now, now, now),
+    db.prepare(
+      `UPDATE target_services SET automation_status = 'failed',
+         health_status = CASE WHEN health_status = 'checking' THEN 'failed' ELSE health_status END,
+         health_error = CASE WHEN health_status = 'checking' THEN '配置任务已停止，请重新检测。' ELSE health_error END,
+         health_http_status = CASE WHEN health_status = 'checking' THEN NULL ELSE health_http_status END,
+         last_error = (SELECT error_message FROM domain_jobs WHERE type = 'target_repair'
+           AND subject_id = target_services.id AND status = 'failed' AND finished_at = ? LIMIT 1), updated_at = ?
+       WHERE id IN (SELECT subject_id FROM domain_jobs WHERE type = 'target_repair' AND status = 'failed' AND finished_at = ?)
+         AND NOT EXISTS (SELECT 1 FROM domain_jobs WHERE subject_type = 'target_service' AND subject_id = target_services.id
+           AND status IN ('queued', 'running', 'retry_wait'))`,
+    ).bind(now, now, now),
+    db.prepare(
       `UPDATE domain_jobs
        SET status = 'running',
            lease_token = ?,
@@ -1162,21 +1272,19 @@ export async function claimNextJob(db: D1Database, leaseSeconds = 600): Promise<
        WHERE id = (
          SELECT id
          FROM domain_jobs
-         WHERE (
-           (status IN ('queued', 'retry_wait') AND next_attempt_at <= ?)
-           OR (status = 'running' AND lease_expires_at <= ?)
-         )
+         WHERE status IN ('queued', 'retry_wait') AND next_attempt_at <= ?
            AND NOT EXISTS (
              SELECT 1 FROM domain_jobs
              WHERE status = 'running' AND lease_expires_at > ?
            )
-         ORDER BY created_at
+         ORDER BY next_attempt_at, created_at
          LIMIT 1
        )
        RETURNING *`,
     )
-    .bind(leaseToken, leaseExpiresAt, now, now, now, now)
-    .first<Row>();
+    .bind(leaseToken, leaseExpiresAt, now, now, now),
+  ]);
+  const row = results[4].results[0];
   return row ? mapJob(row, []) : null;
 }
 
@@ -1185,10 +1293,11 @@ export async function completeJob(db: D1Database, jobId: string, leaseToken: str
     .prepare(
       `UPDATE domain_jobs
        SET status = 'completed', current_step = 'completed', error_message = NULL,
-           lease_token = NULL, lease_expires_at = NULL,
+           lease_token = NULL, lease_expires_at = NULL, lease_loss_count = 0, failure_count = 0,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
            finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status = 'running' AND lease_token = ?`,
+       WHERE id = ? AND status = 'running' AND lease_token = ?
+         AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
     )
     .bind(jobId, leaseToken)
     .run();
@@ -1205,7 +1314,8 @@ export async function setJobResult(
       `UPDATE domain_jobs
        SET payload = json_set(payload, '$.result', json(?)),
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status = 'running' AND lease_token = ?`,
+       WHERE id = ? AND status = 'running' AND lease_token = ?
+         AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
     )
     .bind(JSON.stringify(result), jobId, leaseToken)
     .run();
@@ -1217,24 +1327,26 @@ export async function recordJobFailure(
   leaseToken: string,
   error: unknown,
 ): Promise<JobStatus> {
-  const job = await getJobById(db, jobId);
-  if (!job || job.status !== "running" || job.leaseToken !== leaseToken) {
+  const job = await getJobById(db, jobId, false);
+  if (!job || job.status !== "running" || job.leaseToken !== leaseToken
+    || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt) <= Date.now()) {
     return job?.status ?? "failed";
   }
   const nameserverPending = error instanceof ProviderError && error.code === "nameserver_pending";
   const withinNameserverWindow = Date.now() - Date.parse(job.createdAt) < 48 * 60 * 60_000;
+  const failureCount = nameserverPending ? 0 : job.failureCount + 1;
   const retryable = nameserverPending
     ? withinNameserverWindow
-    : error instanceof ProviderError && error.retryable && job.attemptCount < job.maxAttempts;
+    : error instanceof ProviderError && error.retryable && failureCount < job.maxAttempts;
   const status: JobStatus = retryable ? "retry_wait" : "failed";
   const delaySeconds = nameserverPending
     ? 300
-    : Math.min(3600, 30 * 2 ** Math.max(0, job.attemptCount - 1));
+    : Math.min(3600, 30 * 2 ** Math.max(0, failureCount - 1));
   const message = nameserverPending && !retryable
     ? "Nameserver 在 48 小时内未生效，请检查注册商设置后重试。"
     : error instanceof ProviderError ? error.message : "任务执行失败。";
   const statements: D1PreparedStatement[] = [];
-  if (nameserverPending && !retryable) {
+  if (status === "failed") {
     if (job.redirectDomainId) {
       statements.push(db.prepare(
         `UPDATE redirect_domains
@@ -1242,14 +1354,19 @@ export async function recordJobFailure(
              last_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ? AND EXISTS (
            SELECT 1 FROM domain_jobs WHERE id = ? AND status = 'running' AND lease_token = ?
+             AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )`,
       ).bind(message, job.redirectDomainId, jobId, leaseToken));
     } else if (job.type === "target_repair") {
       statements.push(db.prepare(
         `UPDATE target_services SET automation_status = 'failed', last_error = ?,
+           health_status = CASE WHEN health_status = 'checking' THEN 'failed' ELSE health_status END,
+           health_error = CASE WHEN health_status = 'checking' THEN '配置任务已停止，请重新检测。' ELSE health_error END,
+           health_http_status = CASE WHEN health_status = 'checking' THEN NULL ELSE health_http_status END,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ? AND EXISTS (
            SELECT 1 FROM domain_jobs WHERE id = ? AND status = 'running' AND lease_token = ?
+             AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )`,
       ).bind(message, job.subjectId, jobId, leaseToken));
     }
@@ -1258,22 +1375,34 @@ export async function recordJobFailure(
       `UPDATE domain_jobs
        SET status = ?, error_message = ?, next_attempt_at = ?,
            current_step = CASE WHEN ? THEN 'waiting_nameserver' ELSE current_step END,
+           failure_count = ?, lease_loss_count = 0,
            lease_token = NULL, lease_expires_at = NULL,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
            finished_at = CASE WHEN ? = 'failed' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END
-       WHERE id = ? AND status = 'running' AND lease_token = ?`,
+       WHERE id = ? AND status = 'running' AND lease_token = ?
+         AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
     )
     .bind(
       status,
       message,
       new Date(Date.now() + delaySeconds * 1000).toISOString(),
       nameserverPending ? 1 : 0,
+      failureCount,
       status,
       jobId,
       leaseToken,
     ));
   await db.batch(statements);
   return status;
+}
+
+export async function cleanupJobSteps(db: D1Database): Promise<void> {
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
+  await db.prepare(
+    `DELETE FROM job_steps WHERE job_id IN (
+       SELECT id FROM domain_jobs WHERE status IN ('completed', 'failed') AND finished_at < ?
+     )`,
+  ).bind(cutoff).run();
 }
 
 export async function cleanupVisits(db: D1Database, retentionDays: number): Promise<void> {

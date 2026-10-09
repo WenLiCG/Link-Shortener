@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, ApiError, sessionEvents, formatDate, isOperationPending, isProcessingStatus, operationState, pollingFailure, restoreOperationResults, submissionFailureStatus, retryRequestKey, visibleSelection, waitForOperation, type OperationJob } from "../src/app/src/operations";
+import { api, ApiError, sessionEvents, formatDate, isOperationPending, isProcessingStatus, operationState, pollingFailure, restoreOperationResults, submissionFailureStatus, retryRequestKey, visibleSelection, retainedDateRange, operationPollDelay, type OperationJob } from "../src/app/src/operations";
 import { startOperationPolling } from "../src/app/src/hooks/useOperationPolling";
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -16,42 +16,30 @@ describe("operation state", () => {
   it("leaves retry_wait pending and can observe its eventual completion", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response(job("retry_wait"))).mockResolvedValueOnce(response(job("completed")));
     vi.stubGlobal("fetch", fetch);
-    expect(operationState(await waitForOperation("job-1"))).toMatchObject({ ok: true, status: "retry_wait" });
-    expect(operationState(await waitForOperation("job-1"))).toMatchObject({ ok: true, status: "completed" });
+    expect(operationState(await api<OperationJob>("/api/jobs/job-1"))).toMatchObject({ ok: true, status: "retry_wait" });
+    expect(operationState(await api<OperationJob>("/api/jobs/job-1"))).toMatchObject({ ok: true, status: "completed" });
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("returns a real terminal failure without waiting", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ ...job("failed"), errorMessage: "权限不足" })));
-    const result = await waitForOperation("job-1");
+    const result = await api<OperationJob>("/api/jobs/job-1");
     expect(operationState(result)).toEqual({ ok: false, status: "failed", message: "权限不足" });
     expect(isOperationPending(result)).toBe(false);
   });
 
-  it("retains the job id and running state after the foreground deadline", async () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(response(job("running")))));
-    const pending = waitForOperation("job-1");
-    await vi.advanceTimersByTimeAsync(120_000);
-    const result = await pending;
-    expect(result).toMatchObject({ id: "job-1", status: "running" });
-    expect(result.pollError).toContain("继续自动查询");
-    expect(operationState(result).ok).toBe(true);
-  });
-
-  it("keeps network errors separate from backend failure", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
-    const result = await waitForOperation("job-1");
-    expect(result).toMatchObject({ id: "job-1", status: "queued" });
-    expect(result.pollError).toContain("offline");
+  it("keeps temporary query errors separate from terminal missing records", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValueOnce(new TypeError("offline")).mockResolvedValueOnce(
+      new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "任务不存在" } }), { status: 404 }),
+    ));
+    await expect(api("/api/jobs/job-1")).rejects.toThrow("offline");
     expect(pollingFailure(new Error("offline"))).not.toHaveProperty("status");
-  });
-
-  it("marks a missing record unavailable without inventing a backend failure", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "任务不存在" } }), { status: 404 })));
-    const result = await waitForOperation("job-1");
-    expect(operationState(result)).toEqual({ ok: false, status: "unavailable", message: "任务不存在" });
-    expect(isOperationPending(result)).toBe(false);
+    try {
+      await api("/api/jobs/job-1");
+      throw new Error("expected missing record");
+    } catch (error) {
+      expect(pollingFailure(error)).toEqual({ ok: false, status: "unavailable", message: "任务不存在" });
+    }
   });
 
   it("rechecks stored failures with a job id while retaining the retry payload", () => {
@@ -117,14 +105,74 @@ describe("API session errors", () => {
 });
 
 describe("background polling", () => {
+  it("polls running jobs quickly without dragging retry_wait jobs into the same interval", async () => {
+    vi.useFakeTimers();
+    const nextAttemptAt = new Date(Date.now() + 300_000).toISOString();
+    const fetch = vi.fn(async (id: string) => id === "waiting" ? { ...job("retry_wait"), nextAttemptAt } : job("running"));
+    const stop = startOperationPolling(["waiting", "running"], fetch, vi.fn(), 3_000);
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(fetch.mock.calls.filter(([id]) => id === "waiting")).toHaveLength(1);
+    expect(fetch.mock.calls.filter(([id]) => id === "running")).toHaveLength(20);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetch.mock.calls.filter(([id]) => id === "waiting")).toHaveLength(2);
+    stop();
+  });
+
+  it("stops polling completed and failed jobs", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async (id: string) => job(id === "done" ? "completed" : "failed"));
+    const stop = startOperationPolling(["done", "failed"], fetch, vi.fn(), 3_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  it("preserves a waiting job's schedule when another accepted job joins the list", async () => {
+    vi.useFakeTimers();
+    const savedState = new Map();
+    const fetch = vi.fn(async () => ({ ...job("retry_wait"), nextAttemptAt: new Date(Date.now() + 300_000).toISOString() }));
+    const first = startOperationPolling(["waiting"], fetch, vi.fn(), 3_000, undefined, savedState);
+    await vi.advanceTimersByTimeAsync(3_000);
+    first();
+    const second = startOperationPolling(["waiting", "new"], fetch, vi.fn(), 3_000, undefined, savedState);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fetch.mock.calls).toHaveLength(2);
+    second();
+  });
+
+  it("pauses a hidden page and refreshes immediately when it becomes visible", async () => {
+    vi.useFakeTimers();
+    const visibility = Object.assign(new EventTarget(), { hidden: true });
+    const fetch = vi.fn().mockResolvedValue(job("running"));
+    const stop = startOperationPolling(["job-1"], fetch, vi.fn(), 3_000, visibility);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).not.toHaveBeenCalled();
+    visibility.hidden = false;
+    visibility.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetch).toHaveBeenCalledOnce();
+    visibility.hidden = true;
+    visibility.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledOnce();
+    visibility.hidden = false;
+    visibility.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    stop();
+    visibility.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("waits for a slow request to settle before scheduling another", async () => {
     vi.useFakeTimers();
-    let finish!: () => void;
-    const fetch = vi.fn().mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; })).mockResolvedValue(undefined);
+    let finish!: (job: OperationJob) => void;
+    const fetch = vi.fn().mockImplementationOnce(() => new Promise<OperationJob>((resolve) => { finish = resolve; })).mockResolvedValue(job("running"));
     const stop = startOperationPolling(["job-1"], fetch, vi.fn(), 3_000);
     await vi.advanceTimersByTimeAsync(15_000);
     expect(fetch).toHaveBeenCalledOnce();
-    finish();
+    finish(job("running"));
     await vi.advanceTimersByTimeAsync(3_000);
     expect(fetch).toHaveBeenCalledTimes(2);
     stop();
@@ -132,7 +180,7 @@ describe("background polling", () => {
 
   it("stops missing jobs while continuing other jobs", async () => {
     vi.useFakeTimers();
-    const fetch = vi.fn(async (id: string) => { if (id === "missing") throw new ApiError(404, "not_found", "任务不存在"); });
+    const fetch = vi.fn(async (id: string) => { if (id === "missing") throw new ApiError(404, "not_found", "任务不存在"); return job("running"); });
     const errors = vi.fn();
     const stop = startOperationPolling(["missing", "live"], fetch, errors, 3_000);
     await vi.advanceTimersByTimeAsync(12_000);
@@ -144,7 +192,7 @@ describe("background polling", () => {
 
   it("backs off after network errors and restores the normal interval on recovery", async () => {
     vi.useFakeTimers();
-    const fetch = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(undefined);
+    const fetch = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(job("running"));
     const errors = vi.fn();
     const stop = startOperationPolling(["job-1"], fetch, errors, 3_000);
     await vi.advanceTimersByTimeAsync(3_000);
@@ -162,7 +210,7 @@ describe("background polling", () => {
     let signal!: AbortSignal;
     const fetch = vi.fn((_id: string, requestSignal: AbortSignal) => {
       signal = requestSignal;
-      return new Promise<void>((_resolve, reject) => requestSignal.addEventListener("abort", () => reject(new Error("aborted"))));
+      return new Promise<OperationJob>((_resolve, reject) => requestSignal.addEventListener("abort", () => reject(new Error("aborted"))));
     });
     const errors = vi.fn();
     const stop = startOperationPolling(["job-1"], fetch, errors, 3_000);
@@ -181,4 +229,21 @@ it("excludes hidden selections even when the filtered list has the same length",
 
 it("formats timestamps in the same Shanghai day used by statistics", () => {
   expect(formatDate("2026-10-08T16:01:00Z")).toBe("10/09 00:01");
+});
+
+it("keeps waiting jobs between thirty and sixty seconds even after their scheduled retry", () => {
+  vi.useFakeTimers();
+  expect(operationPollDelay({ ...job("retry_wait"), nextAttemptAt: new Date(Date.now() + 20_000).toISOString() }, 3_000)).toBe(30_000);
+  expect(operationPollDelay({ ...job("retry_wait"), nextAttemptAt: new Date(Date.now() + 45_000).toISOString() }, 3_000)).toBe(45_000);
+  expect(operationPollDelay({ ...job("retry_wait"), nextAttemptAt: new Date(Date.now() + 300_000).toISOString() }, 3_000)).toBe(60_000);
+  expect(operationPollDelay({ ...job("retry_wait"), nextAttemptAt: "invalid" }, 3_000)).toBe(60_000);
+  expect(operationPollDelay({ ...job("retry_wait"), nextAttemptAt: new Date(Date.now() - 1).toISOString() }, 3_000)).toBe(30_000);
+});
+
+it("derives inclusive retention bounds in Shanghai days", () => {
+  const now = Date.parse("2026-10-08T16:01:00Z");
+  expect(retainedDateRange(30, now)).toEqual({ days: 30, from: "2026-09-10", to: "2026-10-09" });
+  expect(retainedDateRange(1, now)).toEqual({ days: 1, from: "2026-10-09", to: "2026-10-09" });
+  expect(retainedDateRange(-1, now).days).toBe(30);
+  expect(retainedDateRange(365, now).from).toBe("2025-10-10");
 });

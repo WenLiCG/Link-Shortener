@@ -1,15 +1,28 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
-import { cleanupVisits, createRedirectDomain, findDomainByHost, getDomainDetail, summaryStats } from "../../src/worker/db";
+import { cleanupVisits, createRedirectDomain, findDomainByHost, getDomainDetail, getTargetById, listTargets, summaryStats } from "../../src/worker/db";
 import { daysAgo, today } from "../../src/worker/shared";
 import { runScheduled } from "../../src/worker/automation";
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM traffic_daily_visitors").run();
   await env.DB.prepare("DELETE FROM redirect_domains").run();
+  await env.DB.prepare("DELETE FROM short_links").run();
+  await env.DB.prepare("DELETE FROM target_services").run();
 });
 
 describe("domain reads and retained traffic", () => {
+  it("counts target references independently across domains and short links", async () => {
+    await env.DB.prepare("INSERT INTO target_services (id, name, target_host) VALUES ('used', 'Used', 'used.example'), ('empty', 'Empty', 'empty.example')").run();
+    await env.DB.prepare("INSERT INTO redirect_domains (id, domain, target_service_id) VALUES ('a', 'a.example', 'used'), ('b', 'b.example', 'used')").run();
+    await env.DB.prepare("INSERT INTO short_links (id, code, target_service_id, original_url) VALUES ('s1', 'a', 'used', 'https://destination.example/'), ('s2', 'b', 'used', 'https://destination.example/'), ('s3', 'c', 'used', 'https://destination.example/')").run();
+    const targets = await listTargets(env.DB);
+    expect(targets.find((target) => target.id === "used")?.usageCount).toBe(5);
+    expect(targets.find((target) => target.id === "empty")?.usageCount).toBe(0);
+    expect((await getTargetById(env.DB, "used"))?.usageCount).toBe(5);
+    expect(await getTargetById(env.DB, "missing")).toBeNull();
+  });
+
   it("selects the closest active domain and falls back past hidden subdomains", async () => {
     await env.DB.prepare(
       `INSERT INTO redirect_domains (id, domain, status, list_visible)

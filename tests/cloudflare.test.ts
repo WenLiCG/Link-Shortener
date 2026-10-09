@@ -76,6 +76,62 @@ describe("cloudflare client", () => {
     expect(signal).toBeInstanceOf(AbortSignal);
   });
 
+  it.each([
+    { status: 400, upstreamCode: 1004, code: "api_1004", retryable: false, message: "请求参数无效" },
+    { status: 403, upstreamCode: 9109, code: "api_9109", retryable: false, message: "权限不足" },
+    { status: 200, upstreamCode: 10000, code: "api_10000", retryable: false, message: "身份验证失败" },
+    { status: 429, upstreamCode: 1015, code: "api_1015", retryable: true, message: "请求过于频繁" },
+    { status: 503, upstreamCode: null, code: "http_503", retryable: true, message: "暂时不可用" },
+    { status: 400, upstreamCode: "https://secret.example/?token=private", code: "http_400", retryable: false, message: "请求参数无效" },
+  ])("retains safe error details for HTTP $status / $code", async ({ status, upstreamCode, code, retryable, message }) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(upstreamCode === null
+      ? new Response("<html>https://secret.example/?token=private</html>", { status })
+      : jsonResponse({ success: false, errors: [{ code: upstreamCode, message: "https://secret.example/?token=private" }] }, status));
+
+    const error = await ensureZone(env, "example.com").catch((error: unknown) => error);
+
+    expect(error).toMatchObject({ provider: "cloudflare", status, code, retryable, message: expect.stringContaining(message) });
+    expect(JSON.stringify(error)).not.toContain("secret.example");
+    expect(String(error)).not.toContain("private");
+  });
+
+  it("rejects a malformed successful response as retryable", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not json"));
+
+    await expect(ensureZone(env, "example.com")).rejects.toMatchObject({
+      status: 200, code: "invalid_response", retryable: true,
+    });
+  });
+
+  it.each(["caller", "request"])("keeps %s cancellation active while reading the response body", async (source) => {
+    const caller = new AbortController();
+    const timeout = new AbortController();
+    const timeoutMock = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => new Response(new ReadableStream({
+      start(stream) {
+        init?.signal?.addEventListener("abort", () => stream.error(init.signal?.reason), { once: true });
+        queueMicrotask(() => (source === "caller" ? caller : timeout).abort(new DOMException("expired", "TimeoutError")));
+      },
+    })));
+
+    await expect(ensureZone(env, "example.com", caller.signal)).rejects.toMatchObject({
+      status: 200, code: "timeout", retryable: true,
+    });
+    expect(timeoutMock).toHaveBeenCalledWith(10_000);
+    expect(source === "caller" ? timeout.signal.aborted : caller.signal.aborted).toBe(false);
+  });
+
+  it("stops a multi-request DNS repair when the job expires", async () => {
+    const caller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      caller.abort();
+      return jsonResponse({ success: true, result: [] });
+    });
+
+    await expect(ensureDnsRecords(env, "zone-1", "example.com", caller.signal)).rejects.toMatchObject({ code: "timeout" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("creates missing dns records", async () => {
     const created: Array<Record<string, unknown>> = [];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {

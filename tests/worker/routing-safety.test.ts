@@ -31,6 +31,32 @@ function mockZone(name = "unused.example.org") {
 }
 
 describe("forward routing", () => {
+  it("lists hidden failed domains only when explicitly requested and keeps them unroutable", async () => {
+    await env.DB.prepare("INSERT INTO redirect_domains (id, domain, status, list_visible, redirect_mode, direct_target_host) VALUES ('hidden', 'hidden.example.net', 'failed', 0, 'direct', 'https://destination.example/')").run();
+    const cookie = (await createSessionCookie(env)).split(";", 1)[0];
+    async function list(query: string) {
+      const response = await handleApi(new Request(`https://admin.example.com/api/domains?${query}`, { headers: { cookie } }), env, {} as ExecutionContext);
+      return (await response.json<{ data: Array<{ id: string }> }>()).data;
+    }
+    expect(await list("status=failed")).toEqual([]);
+    expect(await list("status=failed&includeHidden=true")).toEqual([expect.objectContaining({ id: "hidden" })]);
+    expect((await SELF.fetch("https://hidden.example.net/", { redirect: "manual" })).status).toBe(404);
+    await expect(handleApi(new Request("https://admin.example.com/api/domains?includeHidden=true"), env, {} as ExecutionContext)).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("returns lightweight job status without executing queued work or exposing the lease", async () => {
+    const job = await enqueueJob(env.DB, { type: "zone_delete", subjectType: "domain", subjectId: "read.example", payload: { domain: "read.example" }, idempotencyKey: "read-only" });
+    await env.DB.prepare("INSERT INTO job_steps (id, job_id, step, status, message) VALUES ('step', ?, 'queued', 'ok', 'History')").bind(job.id).run();
+    const cookie = (await createSessionCookie(env)).split(";", 1)[0];
+    const ctx = createExecutionContext();
+    const response = await handleApi(new Request(`https://admin.example.com/api/jobs/${job.id}`, { headers: { cookie } }), env, ctx);
+    await waitOnExecutionContext(ctx);
+    const { data } = await response.json<{ data: Record<string, unknown> }>();
+    expect(data).toMatchObject({ status: "queued", steps: [] });
+    expect(data).not.toHaveProperty("leaseToken");
+    expect(await env.DB.prepare("SELECT attempt_count FROM domain_jobs WHERE id = ?").bind(job.id).first("attempt_count")).toBe(0);
+  });
+
   it("keeps an empty configured forward target unavailable", async () => {
     await target();
     await env.DB.prepare(

@@ -100,7 +100,7 @@ describe("durable job queue", () => {
     )).resolves.toBe("retry_wait");
 
     expect((await getJobById(env.DB, queued.id))?.status).toBe("retry_wait");
-    await env.DB.prepare("UPDATE domain_jobs SET next_attempt_at = datetime('now', '-1 second') WHERE id = ?").bind(queued.id).run();
+    await env.DB.prepare("UPDATE domain_jobs SET next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?").bind(queued.id).run();
     expect((await claimNextJob(env.DB))?.id).toBe(queued.id);
   });
 
@@ -215,7 +215,7 @@ describe("host role exclusivity", () => {
       `UPDATE domain_jobs
        SET status = 'running',
            lease_token = 'active-lease',
-           lease_expires_at = datetime('now', '+10 minutes')
+           lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+10 minutes')
        WHERE id = ?`,
     ).bind(blocker.id).run();
 
@@ -289,7 +289,7 @@ describe("domain creation idempotency", () => {
       `UPDATE domain_jobs
        SET status = 'running',
            lease_token = 'active-lease',
-           lease_expires_at = datetime('now', '+10 minutes')
+           lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+10 minutes')
        WHERE id = ?`,
     ).bind(pending.id).run();
 

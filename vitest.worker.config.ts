@@ -10,6 +10,9 @@ export default defineConfig({
     cloudflareTest(async () => ({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
+        outboundService: async () => {
+          throw new Error("Real outbound requests are disabled in Worker tests.");
+        },
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations(path.join(root, "migrations")),
           ADMIN_HOST: "admin.example.com",
@@ -17,6 +20,7 @@ export default defineConfig({
           PASSWORD_PEPPER: "test-password-pepper",
           CLOUDFLARE_ACCOUNT_ID: "test-account",
           CLOUDFLARE_API_TOKEN: "test-cloudflare-token",
+          DYNADOT_API_KEY: "",
           VISITOR_HASH_SECRET: "0123456789abcdef0123456789abcdef",
           VERIFICATION_SIGNING_SECRET: "test-verification-secret",
           TURNSTILE_SITE_KEY: "1x00000000000000000000BB",

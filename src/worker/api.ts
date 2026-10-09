@@ -8,7 +8,6 @@ import {
   requireSession,
   verifyPassword,
 } from "./auth";
-import { processNextJob } from "./automation";
 import { listZones } from "./cloudflare";
 import {
   createShortLink,
@@ -29,6 +28,7 @@ import {
   listTargets,
   markTargetHealthChecking,
   retryDomain,
+  retryTarget,
   setSetting,
   shortLinkCodeExists,
   summaryStats,
@@ -437,7 +437,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/nameserver-tool") {
     assertMethod(request, "POST");
     const result = await enqueueNameserverJob(env, request, await readJson<NameserverToolBody>(request));
-    ctx.waitUntil(processNextJob(env));
     return ok(result, { status: 202 });
   }
 
@@ -448,19 +447,15 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   if (pathname === "/api/cloudflare-zones/delete") {
     assertMethod(request, "POST");
     const result = await enqueueCloudflareZoneDelete(env, request, await readJson<DeleteCloudflareZonesBody>(request));
-    ctx.waitUntil(processNextJob(env));
     return ok(result, { status: 202 });
   }
 
   const jobMatch = pathname.match(/^\/api\/jobs\/([^/]+)$/);
   if (jobMatch) {
     assertMethod(request, "GET");
-    const job = await getJobById(env.DB, jobMatch[1]);
+    const job = await getJobById(env.DB, jobMatch[1], false);
     if (!job) {
       throw new HttpError(404, "not_found", "任务不存在。");
-    }
-    if (job.status === "queued" || job.status === "retry_wait") {
-      ctx.waitUntil(processNextJob(env));
     }
     const { leaseToken: _leaseToken, leaseExpiresAt: _leaseExpiresAt, ...publicJob } = job;
     return ok(publicJob);
@@ -495,7 +490,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
         forwardTargetHost,
         description: body.description?.trim() ?? "",
       });
-      ctx.waitUntil(processNextJob(env));
       return ok({ ...created.target, jobId: created.jobId, jobStatus: "queued" }, { status: 202 });
     }
   }
@@ -529,7 +523,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       payload: { targetHost: target.targetHost },
       idempotencyKey: idempotencyKey(request, "target_delete", target.id),
     });
-    ctx.waitUntil(processNextJob(env));
     return ok({ id: target.id, jobId: job.id, status: job.status }, { status: 202 });
   }
 
@@ -581,25 +574,12 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (!target) {
       throw new HttpError(404, "not_found", "目标服务不存在。");
     }
-    await markTargetHealthChecking(env.DB, target.id);
-    const job = await enqueueJob(env.DB, {
-      type: "target_repair",
-      subjectType: "target_service",
-      subjectId: target.id,
-      payload: {},
-      idempotencyKey: idempotencyKey(
-        request,
-        "target_repair",
-        `${target.id}:${target.lastCheckedAt ?? target.updatedAt}`,
-      ),
-    });
-    ctx.waitUntil(processNextJob(env));
+    const job = await retryTarget(env.DB, target.id,
+      idempotencyKey(request, "target_repair", `${target.id}:${crypto.randomUUID()}`));
     return ok({
       id: target.id,
       jobId: job.id,
       status: job.status,
-      automationStatus: "cloudflare_zone",
-      healthStatus: "checking",
     }, { status: 202 });
   }
 
@@ -632,6 +612,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
           days: daysValue ? Number(daysValue) : undefined,
           visitedFrom,
           visitedTo,
+          includeHidden: query(url, "includeHidden") === "true",
         }),
       );
     }
@@ -685,7 +666,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
               existing.targetForwardHost !== (redirectMode === "target_service_forward" ? targetForwardHost : null) ||
               existing.groupId !== groupId || existing.hideReferer !== Boolean(body.hideReferer)
             ) {
-              results.push({ domain, ok: false, error: "域名已存在，提交的配置与原配置不同。请按原配置重试，或先删除系统配置后重新添加。" });
+              results.push({ domain, ok: false, id: existing.id, error: "域名已存在，提交的配置与原配置不同。请在域名管理中勾选“显示未完成配置”，查看原配置或删除后重新添加。" });
               continue;
             }
             const job = await retryDomain(
@@ -693,7 +674,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
               existing.id,
               idempotencyKey(request, "domain_retry", `${existing.id}:${crypto.randomUUID()}`),
             );
-            ctx.waitUntil(processNextJob(env));
             results.push({ domain, ok: true, id: existing.id, jobId: job.id });
             continue;
           } else {
@@ -711,7 +691,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
             groupId,
             hideReferer: Boolean(body.hideReferer),
           });
-          ctx.waitUntil(processNextJob(env));
           results.push({ domain, ok: true, id: created.domain.id, jobId: created.jobId });
         } catch (error) {
           results.push({
@@ -744,7 +723,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
         },
         idempotencyKey: idempotencyKey(request, "domain_delete", id),
       });
-      ctx.waitUntil(processNextJob(env));
       return ok({
         deleted: 0,
         jobId: job.id,
@@ -781,8 +759,8 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       env.DB,
       retryMatch[1],
       idempotencyKey(request, "domain_retry", `${detail.id}:${crypto.randomUUID()}`),
+      true,
     );
-    ctx.waitUntil(processNextJob(env));
     return ok({ jobId: job.id, status: job.status }, { status: 202 });
   }
 
@@ -813,6 +791,7 @@ export function apiError(error: unknown): Response {
     return fail(error.status, error.code, error.message);
   }
   const requestId = crypto.randomUUID();
+  let response: Response;
   if (error instanceof ProviderError) {
     console.error(JSON.stringify({
       event: "provider_error",
@@ -821,8 +800,19 @@ export function apiError(error: unknown): Response {
       status: error.status,
       code: error.code,
     }));
-    return fail(error.retryable ? 503 : 502, "server_error", error.message);
+    response = fail(error.retryable ? 503 : 502, "server_error", error.message);
+  } else {
+    const databaseCode = error instanceof Error
+      ? ["SQLITE_CONSTRAINT", "SQLITE_BUSY", "SQLITE_ERROR", "D1_TYPE_ERROR", "D1_EXEC_ERROR", "D1_ERROR"].find((code) => error.message.includes(code))
+      : undefined;
+    const category = databaseCode ? "database_error"
+      : error instanceof TypeError ? "type_error"
+      : error instanceof RangeError ? "range_error"
+      : error instanceof SyntaxError ? "syntax_error"
+      : "internal_error";
+    console.error(JSON.stringify({ event: "api_error", requestId, category, code: databaseCode }));
+    response = fail(500, "server_error", "服务器内部错误。");
   }
-  console.error(JSON.stringify({ event: "api_error", requestId }));
-  return fail(500, "server_error", "服务器内部错误。");
+  response.headers.set("x-request-id", requestId);
+  return response;
 }

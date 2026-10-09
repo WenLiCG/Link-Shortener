@@ -40,6 +40,31 @@ describe("dynadot client", () => {
     });
   });
 
+  it.each(["caller", "request"])("keeps %s cancellation active while reading the response body", async (source) => {
+    const caller = new AbortController();
+    const timeout = new AbortController();
+    const timeoutMock = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => new Response(new ReadableStream({
+      start(stream) {
+        init?.signal?.addEventListener("abort", () => stream.error(init.signal?.reason), { once: true });
+        queueMicrotask(() => (source === "caller" ? caller : timeout).abort(new DOMException("expired", "TimeoutError")));
+      },
+    })));
+
+    await expect(isDomainInDynadot(env, "example.com", caller.signal)).rejects.toMatchObject({
+      status: 200, code: "timeout", retryable: true,
+    });
+    expect(timeoutMock).toHaveBeenCalledWith(10_000);
+    expect(source === "caller" ? timeout.signal.aborted : caller.signal.aborted).toBe(false);
+  });
+
+  it("does not submit a nameserver change after the job expires", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    await expect(setNameservers(env, "example.com", ["a.ns", "b.ns"], AbortSignal.abort())).rejects.toMatchObject({ code: "timeout" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("marks HTTP 429 as retryable without exposing the response body", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("secret upstream details", { status: 429 }));
 
